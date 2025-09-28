@@ -2,22 +2,29 @@
 \cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
 {\colortbl;\red255\green255\blue255;}
 {\*\expandedcolortbl;;}
-\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\margl1440\margr1440\vieww11120\viewh8400\viewkind0
 \pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
 
 \f0\fs24 \cf0 const express = require('express');\
 const nodemailer = require('nodemailer');\
 const bodyParser = require('body-parser');\
+const cors = require('cors');\
 \
 const app = express();\
+\
+// Allow only your site domains to call this API\
+app.use(cors(\{\
+  origin: ['https://1stanswerbot.com','https://www.1stanswerbot.com']\
+\}));\
+\
 app.use(bodyParser.json());\
 \
-// API endpoint DocsBot will call when it doesn\'92t know the answer\
+// Escalation endpoint\
 app.post('/escalate', async (req, res) => \{\
   const \{ question, userEmail \} = req.body;\
 \
   try \{\
-    // Configure email transport\
+    // Configure Gmail transporter\
     let transporter = nodemailer.createTransport(\{\
       service: 'Gmail',\
       auth: \{\
@@ -26,9 +33,10 @@ app.post('/escalate', async (req, res) => \{\
       \}\
     \});\
 \
+    // Send the email\
     await transporter.sendMail(\{\
       from: `"1st Answer Bot" <$\{process.env.EMAIL_USER\}>`,\
-      to: process.env.SUPPORT_EMAIL,\
+      to: process.env.ADMIN_EMAIL,\
       subject: "Unanswered Bot Question",\
       text: `Question: $\{question\}\\nUser: $\{userEmail || "unknown"\}`\
     \});\
@@ -40,6 +48,7 @@ app.post('/escalate', async (req, res) => \{\
   \}\
 \});\
 \
+// Start server\
 const PORT = process.env.PORT || 3000;\
 app.listen(PORT, () => console.log(`Server running on port $\{PORT\}`));\
 }
