@@ -24,6 +24,32 @@ if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 const app = express();
 const upload = multer();
 
+app.post('/inbound', upload.any(), (req, res) => {
+  try {
+    const payload = {
+      from: req.body.from,
+      to: req.body.to,
+      subject: req.body.subject,
+      text: req.body.text,
+      html: req.body.html,
+      envelope: req.body.envelope
+    };
+
+    console.log("Inbound email received:", payload);
+
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(
+      path.join(DATA_DIR, `inbound_${Date.now()}.json`),
+      JSON.stringify(payload, null, 2)
+    );
+
+    res.status(200).send("ok");
+  } catch (err) {
+    console.error("Inbound error:", err);
+    res.status(200).send("ok");
+  }
+});
+
 // disable cache + log requests
 app.use((req, res, next) => {
   res.set('Cache-Control', 'no-store');
@@ -36,8 +62,8 @@ app.use('/public', express.static(PUBLIC_DIR));
 app.use(express.static(PUBLIC_DIR));
 
 // explicit routes
-app.get('/test.html', (_req, res) => {
-  res.sendFile(path.join(PUBLIC_DIR, 'test.html'));
+app.get('/', (_req, res) => {
+  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
 app.get('/', (_req, res) => {
   res.sendFile(path.join(PUBLIC_DIR, 'test.html'));
