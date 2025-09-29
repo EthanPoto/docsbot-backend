@@ -1,159 +1,166 @@
-// 2) server.js — REPLACE content with this exact file (your logic kept, debug added)
+// server.js
 console.log('BOOT server.js', { cwd: process.cwd(), file: __filename, node: process.version });
 
 const express = require('express');
-const nodemailer = require('nodemailer');
+const fs = require('fs');
+const path = require('path');
+const multer = require('multer');
+const PDFDocument = require('pdfkit');
+const cron = require('node-cron');
+const { DateTime } = require('luxon');
 
 const app = express();
-const cors = require('cors');
-app.use(cors({
-  origin: [
-    'https://1stanswerbot.com',
-    'https://www.1stanswerbot.com',
-    'http://localhost:3000',
-    'http://127.0.0.1:3000'
-  ],
-  methods: ['GET','POST'],
-  allowedHeaders: ['Content-Type']
-}));
-app.options('*', cors());
-app.use(express.json());
+const upload = multer();
 
+// config
 const PORT = process.env.PORT || 3000;
-const ESCALATE_TO = process.env.ESCALATE_TO || 'hello@1stanswerbot.com';
-const ESCALATE_CC = process.env.ESCALATE_CC || '';
-const SMTP_HOST = process.env.SMTP_HOST || '';
-const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
-const SMTP_USER = process.env.SMTP_USER || '';
-const SMTP_PASS = process.env.SMTP_PASS || '';
+const TIMEZONE = 'America/Indiana/Indianapolis';
 
-const SOURCES = []; // {id, title, url}
-const QA = [];      // {q, a, sourceId}
+const DATA_DIR = path.join(process.cwd(), 'data');
+const PUBLIC_DIR = path.join(process.cwd(), 'public');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 
-function simpleMatchScore(q, text) {
-  if (!q || !text) return 0;
-  const words = q.toLowerCase().split(/\W+/).filter(Boolean);
-  const t = text.toLowerCase();
-  let hits = 0;
-  for (const w of words) if (t.includes(w)) hits++;
-  return words.length ? hits / words.length : 0;
+const STORE_PATH = path.join(DATA_DIR, 'qa_store.json');
+const TODAY_PDF = path.join(PUBLIC_DIR, 'qa-today.pdf');
+
+// helpers
+function loadQA() {
+  if (!fs.existsSync(STORE_PATH)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(STORE_PATH, 'utf8'));
+  } catch {
+    return {};
+  }
 }
-
-async function sendEscalationEmail({ question, siteId, ctx }) {
-  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
-    console.log('Escalation skipped. Missing SMTP env.');
-    return;
-  }
-  const tx = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_PORT === 465,
-    auth: { user: SMTP_USER, pass: SMTP_PASS }
-  });
-
-  const subject = `[Escalation] Unanswered question (${siteId || 'no-site'})`;
-  const html = `
-    <p>Unknown question from site: <b>${siteId || 'N/A'}</b></p>
-    <p><b>Question:</b> ${question}</p>
-    <p><b>Context:</b> ${ctx || 'N/A'}</p>
-    <p>Please reply-all. Once answered, paste the Q&A into the PDF and re-upload.</p>
-  `;
-
-  await tx.sendMail({
-    from: SMTP_USER,
-    to: ESCALATE_TO,
-    cc: ESCALATE_CC || undefined,
-    subject,
-    html
-  });
+function saveQA(data) {
+  fs.writeFileSync(STORE_PATH, JSON.stringify(data, null, 2));
 }
+function regeneratePdfFromStore() {
+  const store = loadQA();
+  const doc = new PDFDocument({ margin: 40 });
+  const tmp = TODAY_PDF + '.tmp';
 
-// health and root
-app.get('/healthz', (_req, res) => res.send('ok'));
-app.get('/', (_req, res) => res.send('Hello from Docsbot Backend'));
+  const stream = fs.createWriteStream(tmp);
+  doc.pipe(stream);
 
-// whoami debug (ADDED)
-app.get('/whoami', (_req, res) => {
-  res.json({
-    cwd: process.cwd(),
-    file: __filename,
-    node: process.version,
-    envPort: process.env.PORT || null
-  });
-});
+  const zoneNow = DateTime.now().setZone(TIMEZONE).toFormat('yyyy-LL-dd HH:mm');
+  doc.fontSize(18).text('Q&A – Today', { underline: true });
+  doc.moveDown(0.5);
+  doc.fontSize(10).text(`Generated: ${zoneNow} ${TIMEZONE}`);
+  doc.moveDown();
 
-// add a source
-app.post('/api/sources/add', (req, res) => {
-  const { title, url } = req.body || {};
-  if (!title || !url) return res.status(400).json({ error: 'title and url required' });
-  const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  SOURCES.push({ id, title, url });
-  return res.json({ ok: true, id });
-});
-
-// seed Q&A
-app.post('/api/qa/add', (req, res) => {
-  const { q, a, sourceId } = req.body || {};
-  if (!q || !a) return res.status(400).json({ error: 'q and a required' });
-  QA.push({ q, a, sourceId: sourceId || null });
-  return res.json({ ok: true, total: QA.length });
-});
-
-// chat endpoint
-app.post('/api/chat', async (req, res) => {
-  const { question, siteId } = req.body || {};
-  if (!question) return res.status(400).json({ error: 'question required' });
-
-  let best = null;
-  let bestScore = 0;
-  for (const qa of QA) {
-    const s1 = simpleMatchScore(question, qa.q);
-    const s2 = simpleMatchScore(question, qa.a);
-    const score = Math.max(s1, s2);
-    if (score > bestScore) { bestScore = score; best = qa; }
-  }
-
-  if (best && bestScore >= 0.6) {
-    return res.json({
-      answer: best.a,
-      confidence: Number(bestScore.toFixed(2)),
-      sourceId: best.sourceId || null,
-      sources: SOURCES
-    });
-  }
-
-  const ctx = `Known QA count: ${QA.length}. Sources count: ${SOURCES.length}. BestScore: ${bestScore.toFixed(2)}`;
-  try { await sendEscalationEmail({ question, siteId, ctx }); }
-  catch (e) { console.error('Escalation email failed:', e.message); }
-
-  return res.json({
-    answer: "I don't have that answer yet. I sent your question to a human. We'll add it to the docs.",
-    confidence: Number(bestScore.toFixed(2)),
-    escalated: true
-  });
-});
-
-// status
-app.get('/api/status', (_req, res) => {
-  res.json({ ok: true, qaCount: QA.length, sourceCount: SOURCES.length });
-});
-
-// __routes debug (ADDED)
-function collectRoutes(appRef){
-  const out = [];
-  appRef._router.stack.forEach((m) => {
-    if (m.route) {
-      const methods = Object.keys(m.route.methods).map(x => x.toUpperCase()).join(',');
-      out.push({ methods, path: m.route.path });
+  const entries = Object.entries(store);
+  if (entries.length === 0) {
+    doc.fontSize(12).text('No entries yet.');
+  } else {
+    for (const [q, a] of entries) {
+      doc.moveDown(0.5);
+      doc.fontSize(14).text('Q: ' + q);
+      doc.moveDown(0.25);
+      doc.fontSize(12).text('A: ' + a);
+      doc.moveDown(0.75);
+      doc.moveTo(40, doc.y).lineTo(555, doc.y).stroke();
     }
+  }
+
+  doc.end();
+  stream.on('finish', () => {
+    fs.renameSync(tmp, TODAY_PDF);
   });
-  return out;
 }
-app.get('/__routes', (_req, res) => {
-  res.json({ routes: collectRoutes(app) });
+
+// SSE
+const clients = new Set();
+function broadcast(event, data) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of clients) {
+    res.write(payload);
+  }
+}
+
+// middleware
+app.use(express.json());
+app.use('/public', express.static(PUBLIC_DIR));
+
+// health
+app.get('/api/status', (req, res) => {
+  const store = loadQA();
+  res.json({
+    ok: true,
+    entries: Object.keys(store).length,
+    pdf: '/public/qa-today.pdf',
+  });
 });
 
+// add Q&A + rebuild PDF + notify clients
+app.post('/api/qa', upload.none(), (req, res) => {
+  const { question, answer } = req.body;
+  if (!question || !answer) {
+    return res.status(400).json({ error: 'Missing question or answer' });
+  }
+  const store = loadQA();
+  store[question] = answer;
+  saveQA(store);
+  regeneratePdfFromStore();
+
+  const payload = { question, answer, pdf: '/public/qa-today.pdf' };
+  broadcast('qa:new', payload);
+  res.json({ success: true, ...payload });
+});
+
+// fetch single answer
+app.get('/api/qa/:question', (req, res) => {
+  const store = loadQA();
+  const ans = store[req.params.question];
+  if (!ans) return res.status(404).json({ error: 'Not found' });
+  res.json({ answer: ans, pdf: '/public/qa-today.pdf' });
+});
+
+// SSE stream for realtime updates
+app.get('/api/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  clients.add(res);
+  req.on('close', () => clients.delete(res));
+});
+
+// daily archive at 23:59 local time
+cron.schedule('59 23 * * *', () => {
+  try {
+    const now = DateTime.now().setZone(TIMEZONE);
+    const dateStr = now.toFormat('yyyy-LL-dd');
+
+    const archiveDir = path.join(DATA_DIR, 'archive');
+    if (!fs.existsSync(archiveDir)) fs.mkdirSync(archiveDir, { recursive: true });
+
+    if (fs.existsSync(TODAY_PDF)) {
+      const dst = path.join(archiveDir, `qa-${dateStr}.pdf`);
+      fs.copyFileSync(TODAY_PDF, dst);
+      console.log('Archived PDF', { dst });
+    }
+
+    // reset for new day
+    saveQA({});
+    regeneratePdfFromStore();
+    broadcast('qa:rollover', { pdf: '/public/qa-today.pdf', date: dateStr });
+  } catch (e) {
+    console.error('Archive job failed', e);
+  }
+}, { timezone: TIMEZONE });
+
+// first boot ensure PDF exists
+if (!fs.existsSync(TODAY_PDF)) {
+  regeneratePdfFromStore();
+}
+
+// start
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server listening on port ${PORT}`);
+  console.log(`Status: http://localhost:${PORT}/api/status`);
+  console.log(`PDF:    http://localhost:${PORT}/public/qa-today.pdf`);
 });
 

@@ -1,0 +1,17 @@
+{
+  "QA": [
+    {
+      "q": "What are your hours?",
+      "a": "Mon–Fri 9–5",
+      "sourceId": "seed",
+      "ts": 1759118514231
+    },
+    {
+      "q": "Hours",
+      "a": "Mon–Fri 9–5",
+      "sourceId": "seed",
+      "ts": 1759155832258
+    }
+  ],
+  "Who are you?": "I am DocsBot."
+}
