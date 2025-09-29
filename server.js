@@ -1,5 +1,5 @@
 // server.js
-console.log('BOOT server.js', { cwd: process.cwd(), file: __filename, node: process.version });
+console.log('BOOT', { cwd: process.cwd(), node: process.version });
 
 const express = require('express');
 const fs = require('fs');
@@ -9,32 +9,58 @@ const PDFDocument = require('pdfkit');
 const cron = require('node-cron');
 const { DateTime } = require('luxon');
 
-const app = express();
-const upload = multer();
-
-// config
 const PORT = process.env.PORT || 3000;
 const TIMEZONE = 'America/Indiana/Indianapolis';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const PUBLIC_DIR = path.join(process.cwd(), 'public');
+const STORE_PATH = path.join(DATA_DIR, 'qa_store.json');
+const TODAY_PDF = path.join(PUBLIC_DIR, 'qa-today.pdf');
+
+// make sure dirs exist
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 
-const STORE_PATH = path.join(DATA_DIR, 'qa_store.json');
-const TODAY_PDF = path.join(PUBLIC_DIR, 'qa-today.pdf');
+const app = express();
+const upload = multer();
+
+// disable cache + log requests
+app.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  console.log(req.method, req.url);
+  next();
+});
+
+// serve static
+app.use('/public', express.static(PUBLIC_DIR));
+app.use(express.static(PUBLIC_DIR));
+
+// explicit routes
+app.get('/test.html', (_req, res) => {
+  res.sendFile(path.join(PUBLIC_DIR, 'test.html'));
+});
+app.get('/', (_req, res) => {
+  res.sendFile(path.join(PUBLIC_DIR, 'test.html'));
+});
+app.get('/raw-test', (_req, res) => {
+  res.type('html').send('<h1>RAW OK</h1><p>No cache</p>');
+});
+
+app.use(express.json());
 
 // helpers
 function loadQA() {
   if (!fs.existsSync(STORE_PATH)) return {};
-  try {
-    return JSON.parse(fs.readFileSync(STORE_PATH, 'utf8'));
-  } catch {
-    return {};
-  }
+  try { return JSON.parse(fs.readFileSync(STORE_PATH, 'utf8')); }
+  catch { return {}; }
 }
 function saveQA(data) {
   fs.writeFileSync(STORE_PATH, JSON.stringify(data, null, 2));
+}
+function cleanAnswer(a) {
+  if (typeof a === 'string') return a;
+  if (a == null) return '';
+  return JSON.stringify(a);
 }
 function regeneratePdfFromStore() {
   const store = loadQA();
@@ -58,47 +84,34 @@ function regeneratePdfFromStore() {
       doc.moveDown(0.5);
       doc.fontSize(14).text('Q: ' + q);
       doc.moveDown(0.25);
-      doc.fontSize(12).text('A: ' + a);
+      doc.fontSize(12).text('A: ' + cleanAnswer(a));
       doc.moveDown(0.75);
       doc.moveTo(40, doc.y).lineTo(555, doc.y).stroke();
     }
   }
 
   doc.end();
-  stream.on('finish', () => {
-    fs.renameSync(tmp, TODAY_PDF);
-  });
+  stream.on('finish', () => fs.renameSync(tmp, TODAY_PDF));
 }
 
 // SSE
 const clients = new Set();
 function broadcast(event, data) {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const res of clients) {
-    res.write(payload);
-  }
+  for (const res of clients) res.write(payload);
 }
 
-// middleware
-app.use(express.json());
-app.use('/public', express.static(PUBLIC_DIR));
-
 // health
-app.get('/api/status', (req, res) => {
+app.get('/api/status', (_req, res) => {
   const store = loadQA();
-  res.json({
-    ok: true,
-    entries: Object.keys(store).length,
-    pdf: '/public/qa-today.pdf',
-  });
+  res.json({ ok: true, entries: Object.keys(store).length, pdf: '/public/qa-today.pdf' });
 });
 
-// add Q&A + rebuild PDF + notify clients
+// add Q&A
 app.post('/api/qa', upload.none(), (req, res) => {
   const { question, answer } = req.body;
-  if (!question || !answer) {
-    return res.status(400).json({ error: 'Missing question or answer' });
-  }
+  if (!question || !answer) return res.status(400).json({ error: 'Missing question or answer' });
+
   const store = loadQA();
   store[question] = answer;
   saveQA(store);
@@ -109,26 +122,25 @@ app.post('/api/qa', upload.none(), (req, res) => {
   res.json({ success: true, ...payload });
 });
 
-// fetch single answer
+// fetch one
 app.get('/api/qa/:question', (req, res) => {
   const store = loadQA();
   const ans = store[req.params.question];
   if (!ans) return res.status(404).json({ error: 'Not found' });
-  res.json({ answer: ans, pdf: '/public/qa-today.pdf' });
+  res.json({ answer: cleanAnswer(ans), pdf: '/public/qa-today.pdf' });
 });
 
-// SSE stream for realtime updates
+// SSE
 app.get('/api/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
-
   clients.add(res);
   req.on('close', () => clients.delete(res));
 });
 
-// daily archive at 23:59 local time
+// daily archive
 cron.schedule('59 23 * * *', () => {
   try {
     const now = DateTime.now().setZone(TIMEZONE);
@@ -143,7 +155,6 @@ cron.schedule('59 23 * * *', () => {
       console.log('Archived PDF', { dst });
     }
 
-    // reset for new day
     saveQA({});
     regeneratePdfFromStore();
     broadcast('qa:rollover', { pdf: '/public/qa-today.pdf', date: dateStr });
@@ -152,15 +163,11 @@ cron.schedule('59 23 * * *', () => {
   }
 }, { timezone: TIMEZONE });
 
-// first boot ensure PDF exists
-if (!fs.existsSync(TODAY_PDF)) {
-  regeneratePdfFromStore();
-}
+// first boot
+if (!fs.existsSync(TODAY_PDF)) regeneratePdfFromStore();
 
 // start
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-  console.log(`Status: http://localhost:${PORT}/api/status`);
-  console.log(`PDF:    http://localhost:${PORT}/public/qa-today.pdf`);
+  console.log(`Server listening on http://localhost:${PORT}`);
+  console.log(`Check: /api/status /public/test.html /test.html /raw-test`);
 });
-
