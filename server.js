@@ -2,15 +2,15 @@
 const express = require('express');
 const app = express();
 
-// Use Render's PORT or fallback to 3000 for local dev
+// Use Render's PORT or default 3000 for local dev
 const PORT = process.env.PORT || 3000;
 
-// Simple health check route
+// Health check route for Render
 app.get('/healthz', (req, res) => {
   res.send('ok');
 });
 
-// Example root route
+// Root route
 app.get('/', (req, res) => {
   res.send('Hello from Docsbot Backend');
 });
