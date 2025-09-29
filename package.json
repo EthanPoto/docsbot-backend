@@ -11,7 +11,10 @@
   },
   "dependencies": {
     "cors": "^2.8.5",
+    "docx": "^9.5.1",
     "express": "^4.19.2",
-    "nodemailer": "^6.9.13"
+    "multer": "^2.0.2",
+    "nodemailer": "^6.9.13",
+    "pdfkit": "^0.17.2"
   }
 }
