@@ -8,6 +8,7 @@ const multer = require('multer');
 const PDFDocument = require('pdfkit');
 const cron = require('node-cron');
 const { DateTime } = require('luxon');
+const nodemailer = require('nodemailer');
 
 const PORT = process.env.PORT || 3000;
 const TIMEZONE = 'America/Indiana/Indianapolis';
@@ -24,6 +25,19 @@ if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 const app = express();
 const upload = multer();
 
+// configure email transport (SendGrid SMTP)
+const transporter = nodemailer.createTransport({
+  host: "smtp.sendgrid.net",
+  port: 587,
+  auth: {
+    user: "apikey", // this literal string is required
+    pass: process.env.SENDGRID_API_KEY
+  }
+});
+
+const COMPANY_REP_EMAIL = process.env.REP_EMAIL || "support@1stanswerbot.com";
+
+// inbound email handler
 app.post('/inbound', upload.any(), (req, res) => {
   try {
     const payload = {
@@ -36,12 +50,39 @@ app.post('/inbound', upload.any(), (req, res) => {
     };
 
     console.log("Inbound email received:", payload);
+    console.log("Saving inbound email to:", DATA_DIR);
 
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    // save raw email to file
     fs.writeFileSync(
       path.join(DATA_DIR, `inbound_${Date.now()}.json`),
       JSON.stringify(payload, null, 2)
     );
+
+    // extract Q/A pairs from text
+    const qa = [];
+    let currentQ = null;
+    for (const line of (payload.text || "").split(/\r?\n/)) {
+      const qm = line.match(/^\s*Q[:\-]\s*(.+)$/i);
+      const am = line.match(/^\s*A[:\-]\s*(.+)$/i);
+      if (qm) currentQ = qm[1].trim();
+      else if (am && currentQ) {
+        qa.push({ q: currentQ, a: am[1].trim(), source: payload.from, ts: Date.now() });
+        currentQ = null;
+      }
+    }
+
+    if (qa.length) {
+      let store = {};
+      if (fs.existsSync(STORE_PATH)) {
+        try { store = JSON.parse(fs.readFileSync(STORE_PATH, 'utf8')); } catch {}
+      }
+      for (const { q, a } of qa) {
+        store[q] = a;
+      }
+      fs.writeFileSync(STORE_PATH, JSON.stringify(store, null, 2));
+      regeneratePdfFromStore();
+      console.log(`Saved ${qa.length} Q/A to qa_store.json`);
+    }
 
     res.status(200).send("ok");
   } catch (err) {
@@ -164,6 +205,41 @@ app.get('/api/stream', (req, res) => {
   res.flushHeaders();
   clients.add(res);
   req.on('close', () => clients.delete(res));
+});
+
+// unknown question → send email to rep
+async function handleUnknownQuestion(question) {
+  const mailOptions = {
+    from: 'hello@1stanswerbot.com',
+    to: COMPANY_REP_EMAIL,
+    subject: `New unanswered question: "${question}"`,
+    text: `
+We received this question: 
+
+Q: ${question}
+
+Please reply to this email in the following format so the bot can learn:
+
+Q: ${question}
+A: [type your answer here]
+    `
+  };
+
+  try {
+    await transporter.sendMail(mailOptions);
+    console.log("Sent unknown-question email to rep");
+  } catch (err) {
+    console.error("Failed to send email", err);
+  }
+}
+
+// API endpoint to trigger unknown question email
+app.post('/api/unknown', express.json(), async (req, res) => {
+  const { question } = req.body;
+  if (!question) return res.status(400).json({ error: 'Missing question' });
+
+  await handleUnknownQuestion(question);
+  res.json({ success: true, sent: true });
 });
 
 // daily archive
