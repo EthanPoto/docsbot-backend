@@ -5,6 +5,18 @@ const express = require('express');
 const nodemailer = require('nodemailer');
 
 const app = express();
+const cors = require('cors');
+app.use(cors({
+  origin: [
+    'https://1stanswerbot.com',
+    'https://www.1stanswerbot.com',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000'
+  ],
+  methods: ['GET','POST'],
+  allowedHeaders: ['Content-Type']
+}));
+app.options('*', cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
