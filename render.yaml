@@ -3,11 +3,23 @@ services:
     name: docsbot-backend
     env: node
     plan: free
-    region: ohio
+    region: oregon
     buildCommand: npm ci
     startCommand: npm start
     envVars:
       - key: NODE_VERSION
         value: 20
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: 587
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: ESCALATE_TO
+        value: hello@1stanswerbot.com
+      - key: ESCALATE_CC
+        value: ""
     healthCheckPath: /healthz
     autoDeploy: true
