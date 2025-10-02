@@ -8,43 +8,72 @@ const multer = require('multer');
 const PDFDocument = require('pdfkit');
 const cron = require('node-cron');
 const { DateTime } = require('luxon');
-const crypto = require('crypto'); // ➕ for content hashing
+const crypto = require('crypto');
 const nodemailer = require('nodemailer');
+const cors = require('cors');
 
+// ------------ CONFIG ------------
 const PORT = process.env.PORT || 3000;
 const TIMEZONE = 'America/Indiana/Indianapolis';
-
-// ➕ allow persistent disk via env
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const PUBLIC_DIR = path.join(process.cwd(), 'public');
 const STORE_PATH = path.join(DATA_DIR, 'qa_store.json');
 const TODAY_PDF = path.join(PUBLIC_DIR, 'qa-today.pdf');
+const PENDING_PATH = path.join(DATA_DIR, 'pending.json');
 
 const INBOUND_SECRET = process.env.INBOUND_SECRET || '';
 const API_KEY = process.env.API_KEY || '';
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || ''; // ➕ bearer for admin endpoints
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
-// make sure dirs exist
+const COMPANY_REP_EMAIL = process.env.REP_EMAIL || 'hello@1stanswerbot.com';
+const REPLY_FROM = process.env.REPLY_FROM || 'hello@1stanswerbot.com';
+
+const TWO_MIN_MS = 2 * 60 * 1000;
+
+// ensure dirs
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 
 const app = express();
-// ➕ limit inbound form body to 1MB
+const ALLOW_ORIGINS = [
+  'https://1stanswerbot.com',
+  'https://www.1stanswerbot.com',
+];
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (ALLOW_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key, X-API-KEY');
+  }
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+  next();
+});
+// body parsers + uploads
+app.use(cors({
+  origin: [
+    'https://1stanswerbot.com',
+    'https://www.1stanswerbot.com',
+  ],
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','x-api-key'],
+}));
+app.options('*', cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 const upload = multer({ limits: { fieldSize: 1 * 1024 * 1024 } });
 
-// configure email transport (SendGrid SMTP)
+// email transport (SendGrid SMTP)
 const transporter = nodemailer.createTransport({
-  host: "smtp.sendgrid.net",
+  host: 'smtp.sendgrid.net',
   port: 587,
-  auth: {
-    user: "apikey", // this literal string is required
-    pass: process.env.SENDGRID_API_KEY
-  }
+  auth: { user: 'apikey', pass: process.env.SENDGRID_API_KEY }
 });
 
-const COMPANY_REP_EMAIL = process.env.REP_EMAIL || "support@1stanswerbot.com";
-
-// simple API key middleware
+// ------------ UTILS ------------
 function requireApiKey(req, res, next) {
   if (!API_KEY) return next();
   const key = req.headers['x-api-key'];
@@ -52,7 +81,6 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-// ➕ tiny HTML→text fallback if email comes as HTML-only
 function htmlToText(html) {
   if (!html) return '';
   return String(html)
@@ -65,13 +93,11 @@ function htmlToText(html) {
     .trim();
 }
 
-// ➕ robust Q/A parser (first Q: ... then A: ...; supports multiline A)
 function parseQAFromText(text) {
   if (!text) return [];
   const lines = String(text).replace(/\r/g, '').split('\n');
   const qa = [];
-  let q = null;
-  let aBuf = [];
+  let q = null, aBuf = [];
   const flush = () => {
     if (q && aBuf.length) {
       const a = aBuf.join('\n').trim();
@@ -85,125 +111,39 @@ function parseQAFromText(text) {
     const am = line.match(/^A[:\-]\s*(.*)$/i);
     if (qm) { flush(); q = qm[1]; continue; }
     if (am) { aBuf.push(am[1]); continue; }
-    if (q && aBuf.length) aBuf.push(raw); // allow multiline answers
+    if (q && aBuf.length) aBuf.push(raw);
   }
   flush();
   return qa;
 }
 
-// ➕ hash helper for dedupe
 function entryHash(q, a) {
   return crypto.createHash('sha256').update(q + '\n' + a).digest('hex');
 }
 
-// inbound email handler
-app.post('/inbound', upload.any(), (req, res) => {
-  try {
-    // secret check for SendGrid webhook
-    if (INBOUND_SECRET) {
-      const sent = (req.query.secret || req.headers['x-inbound-secret'] || '').toString();
-      if (sent !== INBOUND_SECRET) return res.status(403).send('forbidden');
-    }
-
-    const payload = {
-      from: req.body.from,
-      to: req.body.to,
-      subject: req.body.subject,
-      text: req.body.text,
-      html: req.body.html,
-      envelope: req.body.envelope
-    };
-
-    console.log("Inbound email received:", { from: payload.from, to: payload.to, subject: payload.subject });
-    console.log("Saving inbound email to:", DATA_DIR);
-
-    // save raw email to file
-    fs.writeFileSync(
-      path.join(DATA_DIR, `inbound_${Date.now()}.json`),
-      JSON.stringify(payload, null, 2)
-    );
-
-    // ➕ parse with HTML fallback
-    const textBody = payload.text && payload.text.trim() ? payload.text : htmlToText(payload.html);
-    const parsed = parseQAFromText(textBody);
-
-    if (!parsed.length) {
-      console.warn('Inbound parse failed (no Q:/A:). subject=', payload.subject);
-      return res.status(400).json({ ok: false, error: 'Bad format. Use "Q: ...\\nA: ..."' });
-    }
-
-    // load existing store (object of q -> a)
-    let store = {};
-    if (fs.existsSync(STORE_PATH)) {
-      try { store = JSON.parse(fs.readFileSync(STORE_PATH, 'utf8')); } catch {}
-    }
-
-    let added = 0, skipped = 0;
-    for (const { q, a } of parsed) {
-      const existing = store[q];
-      if (typeof existing === 'string' && existing.trim() === a.trim()) {
-        skipped++;
-        continue; // ➕ dedupe: same Q and A already present
-      }
-      store[q] = a;
-      added++;
-    }
-
-    if (added > 0) {
-      fs.writeFileSync(STORE_PATH, JSON.stringify(store, null, 2));
-      regeneratePdfFromStore();
-      console.log(`Saved ${added} Q/A to`, STORE_PATH, 'skipped duplicates:', skipped);
-      console.log('Regenerated PDF at', TODAY_PDF);
-    } else {
-      console.log('No new entries added (all duplicates).');
-    }
-
-    res.status(200).json({ ok: true, added, skipped, entries: Object.keys(store).length });
-  } catch (err) {
-    console.error("Inbound error:", err);
-    // keep 200 for SendGrid to avoid retries; include ok:false for our visibility
-    res.status(200).json({ ok: false, error: 'inbound exception' });
-  }
-});
-
-// disable cache + log requests
-app.use((req, res, next) => {
-  res.set('Cache-Control', 'no-store');
-  console.log(req.method, req.url);
-  next();
-});
-
-// serve static
-app.use('/public', express.static(PUBLIC_DIR));
-app.use(express.static(PUBLIC_DIR));
-
-app.get('/', (_req, res) => {
-  res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
-});
-app.get('/', (_req, res) => {
-  res.sendFile(path.join(PUBLIC_DIR, 'test.html'));
-});
-app.get('/raw-test', (_req, res) => {
-  res.type('html').send('<h1>RAW OK</h1><p>No cache</p>');
-});
-
-app.use(express.json());
-app.use(express.urlencoded({ extended: true, limit: '1mb' })); // ➕ general parsers
-
-// helpers
-function loadQA() {
-  if (!fs.existsSync(STORE_PATH)) return {};
-  try { return JSON.parse(fs.readFileSync(STORE_PATH, 'utf8')); }
-  catch { return {}; }
+function genQID() {
+  return crypto.randomBytes(6).toString('hex'); // 12 chars
 }
-function saveQA(data) {
-  fs.writeFileSync(STORE_PATH, JSON.stringify(data, null, 2));
+
+// ------------ DATA LAYERS ------------
+function loadJSON(p, fallback) {
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fallback; }
 }
+function saveJSON(p, obj) {
+  fs.writeFileSync(p, JSON.stringify(obj, null, 2));
+}
+
+function loadQA() { return loadJSON(STORE_PATH, {}); }
+function saveQA(data) { saveJSON(STORE_PATH, data); }
+function loadPending() { return loadJSON(PENDING_PATH, {}); }
+function savePending(data) { saveJSON(PENDING_PATH, data); }
+
 function cleanAnswer(a) {
   if (typeof a === 'string') return a;
   if (a == null) return '';
   return JSON.stringify(a);
 }
+
 function regeneratePdfFromStore() {
   const store = loadQA();
   const doc = new PDFDocument({ margin: 40 });
@@ -236,27 +176,260 @@ function regeneratePdfFromStore() {
   stream.on('finish', () => fs.renameSync(tmp, TODAY_PDF));
 }
 
-// SSE
+// ------------ SSE ------------
 const clients = new Set();
 function broadcast(event, data) {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const res of clients) res.write(payload);
 }
 
-// health
+// ------------ LOGGER / STATIC ------------
+app.use((req, _res, next) => { console.log(req.method, req.url); next(); });
+app.use('/public', express.static(PUBLIC_DIR));
+app.use(express.static(PUBLIC_DIR));
+
+app.get('/', (_req, res) => {
+  // prefer index.html if it exists, fallback to a tiny page
+  const idx = path.join(PUBLIC_DIR, 'index.html');
+  if (fs.existsSync(idx)) return res.sendFile(idx);
+  res.type('html').send('<h1>DocsBot Backend</h1><p>OK</p>');
+});
+
+app.get('/raw-test', (_req, res) => {
+  res.type('html').send('<h1>RAW OK</h1><p>No cache</p>');
+});
+
+app.get('/api/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+  clients.add(res);
+  req.on('close', () => clients.delete(res));
+});
+
+// ------------ CORE EMAIL FLOW ------------
+
+// Email to rep for unknown question
+async function emailRepAboutUnknown(question, qid) {
+  const subject = `New unanswered question [QID:${qid}]`;
+  const text = `
+We received this question:
+
+Q: ${question}
+
+Please REPLY to this email with the following format so the bot can learn:
+
+Q: ${question}
+A: [type your answer here]
+
+(Keep [QID:${qid}] in the subject)
+  `.trim();
+
+  const mailOptions = {
+    from: REPLY_FROM,
+    to: COMPANY_REP_EMAIL,
+    replyTo: process.env.INBOUND_REPLY_TO || 'qa@replies.1stanswerbot.com',
+    subject,
+    text
+  };
+
+  await transporter.sendMail(mailOptions);
+  console.log('Sent unknown-question email to rep', { to: COMPANY_REP_EMAIL, qid });
+}
+
+// Create pending ticket and email rep
+async function createPendingAndNotify(question, userEmail = null) {
+  const pending = loadPending();
+  const qid = genQID();
+  const now = Date.now();
+
+  pending[qid] = {
+    qid,
+    question,
+    createdAt: now,
+    userEmail: userEmail || null,
+    answeredAt: null
+  };
+  savePending(pending);
+
+  await emailRepAboutUnknown(question, qid);
+
+  return { qid, expiresAt: now + TWO_MIN_MS };
+}
+
+// On answer received (from inbound), decide realtime vs email
+async function handleAnswerDelivery({ qid, question, answer }) {
+  // Always save to store + PDF
+  const store = loadQA();
+  store[question] = answer;
+  saveQA(store);
+  regeneratePdfFromStore();
+
+  const pending = loadPending();
+  const ticket = pending[qid];
+
+  if (!ticket) {
+    console.log('Answer received for unknown QID; saved to store/PDF only', { qid });
+    return { delivered: 'store_only' };
+  }
+
+  const now = Date.now();
+  ticket.answeredAt = now;
+  savePending(pending);
+
+  const within2min = now - ticket.createdAt <= TWO_MIN_MS;
+
+  if (within2min) {
+    // realtime push to chat
+    broadcast('qa:answer', { qid, question, answer, pdf: '/public/qa-today.pdf' });
+    console.log('Pushed realtime answer to chat', { qid });
+    return { delivered: 'chat' };
+  }
+
+  // outside 2 min: email user if we have their email
+  if (ticket.userEmail) {
+    try {
+      await transporter.sendMail({
+        from: REPLY_FROM,
+        to: ticket.userEmail,
+        subject: `Answer to your question`,
+        text: `Q: ${question}\nA: ${answer}\n\nA PDF copy is available here: /public/qa-today.pdf`
+      });
+      console.log('Emailed user answer (outside 2min)', { qid, to: ticket.userEmail });
+      return { delivered: 'email_user' };
+    } catch (e) {
+      console.error('Failed emailing user answer', e);
+      return { delivered: 'email_user_failed' };
+    }
+  }
+
+  console.log('No user email on file; saved to store/PDF only', { qid });
+  return { delivered: 'store_only' };
+}
+
+// ------------ API: Unknown & Email capture ------------
+
+// Trigger unknown flow (chatbot calls this)
+app.post('/api/unknown', requireApiKey, async (req, res) => {
+  try {
+    const { question, userEmail } = req.body || {};
+    if (!question) return res.status(400).json({ error: 'Missing question' });
+
+    const { qid, expiresAt } = await createPendingAndNotify(question, userEmail || null);
+
+    // Tell chat whether to wait or fall back
+    res.json({
+      success: true,
+      qid,
+      expiresAt,
+      waitMs: TWO_MIN_MS,
+      message: 'Question sent to a human. If they reply within 2 minutes, you’ll see the answer here. Otherwise we’ll email you when it’s ready.'
+    });
+  } catch (e) {
+    console.error('unknown flow error', e);
+    res.status(500).json({ error: 'unknown flow failed' });
+  }
+});
+
+// If chat needs to attach an email later (after showing the “we’ll email you” prompt)
+app.post('/api/pending/:qid/email', requireApiKey, (req, res) => {
+  const { qid } = req.params;
+  const { userEmail } = req.body || {};
+  if (!userEmail) return res.status(400).json({ error: 'Missing userEmail' });
+
+  const pending = loadPending();
+  if (!pending[qid]) return res.status(404).json({ error: 'Unknown qid' });
+
+  pending[qid].userEmail = userEmail;
+  savePending(pending);
+  res.json({ success: true });
+});
+
+// ------------ INBOUND (SendGrid) ------------
+
+app.post('/inbound', upload.any(), async (req, res) => {
+  try {
+    // optional secret check
+    if (INBOUND_SECRET) {
+      const sent = (req.query.secret || req.headers['x-inbound-secret'] || '').toString();
+      if (sent !== INBOUND_SECRET) return res.status(403).send('forbidden');
+    }
+
+    const payload = {
+      from: req.body.from,
+      to: req.body.to,
+      subject: req.body.subject || '',
+      text: req.body.text,
+      html: req.body.html,
+      envelope: req.body.envelope
+    };
+
+    console.log('Inbound email:', { from: payload.from, to: payload.to, subject: payload.subject });
+
+    // persist inbound for debugging
+    fs.writeFileSync(
+      path.join(DATA_DIR, `inbound_${Date.now()}.json`),
+      JSON.stringify(payload, null, 2)
+    );
+
+    const textBody = (payload.text && payload.text.trim()) ? payload.text : htmlToText(payload.html);
+    const parsed = parseQAFromText(textBody);
+
+    if (!parsed.length) {
+      console.warn('Inbound parse failed (no Q:/A:)');
+      return res.status(200).json({ ok: false, error: 'Bad format. Use "Q: ...\\nA: ..."' });
+    }
+
+    // Try to extract QID from subject like [QID:abcdef123456]
+    const qidMatch = (payload.subject || '').match(/\[QID:([a-f0-9]{12})\]/i);
+    const qidFromSubject = qidMatch ? qidMatch[1] : null;
+
+    // handle each Q/A found (usually 1)
+    for (const { q, a } of parsed) {
+      let chosenQID = qidFromSubject;
+
+      // If no QID in subject, try to match by exact question against pending
+      if (!chosenQID) {
+        const pending = loadPending();
+        for (const t of Object.values(pending)) {
+          if (t.question && t.question.trim() === q.trim()) {
+            chosenQID = t.qid;
+            break;
+          }
+        }
+      }
+
+      const result = await handleAnswerDelivery({
+        qid: chosenQID || genQID(), // fall back: still save to store/PDF
+        question: q,
+        answer: a
+      });
+
+      console.log('Inbound handled', { qid: chosenQID, delivery: result.delivered });
+    }
+
+    res.status(200).json({ ok: true, parsed: parsed.length });
+  } catch (err) {
+    console.error('Inbound error:', err);
+    // keep 200 for SendGrid; mark ok:false for logs
+    res.status(200).json({ ok: false, error: 'inbound exception' });
+  }
+});
+
+// ------------ Q/A CRUD & STATUS ------------
 app.get('/api/status', (_req, res) => {
   const store = loadQA();
   res.json({ ok: true, entries: Object.keys(store).length, pdf: '/public/qa-today.pdf' });
 });
 
-// add Q&A
 app.post('/api/qa', upload.none(), (req, res) => {
   const { question, answer } = req.body;
   if (!question || !answer) return res.status(400).json({ error: 'Missing question or answer' });
 
   const store = loadQA();
   if (store[question] && String(store[question]).trim() === String(answer).trim()) {
-    return res.json({ success: true, dedup: true, pdf: '/public/qa-today.pdf' }); // ➕ dedupe on API too
+    return res.json({ success: true, dedup: true, pdf: '/public/qa-today.pdf' });
   }
 
   store[question] = answer;
@@ -268,7 +441,6 @@ app.post('/api/qa', upload.none(), (req, res) => {
   res.json({ success: true, ...payload });
 });
 
-// fetch one
 app.get('/api/qa/:question', (req, res) => {
   const store = loadQA();
   const ans = store[req.params.question];
@@ -276,64 +448,16 @@ app.get('/api/qa/:question', (req, res) => {
   res.json({ answer: cleanAnswer(ans), pdf: '/public/qa-today.pdf' });
 });
 
-// SSE
-app.get('/api/stream', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders();
-  clients.add(res);
-  req.on('close', () => clients.delete(res));
-});
-
-// unknown question → send email to rep
-async function handleUnknownQuestion(question) {
-  const mailOptions = {
-    from: 'hello@1stanswerbot.com',
-    to: COMPANY_REP_EMAIL,
-    subject: `New unanswered question: "${question}"`,
-    text: `
-We received this question: 
-
-Q: ${question}
-
-Please reply to this email in the following format so the bot can learn:
-
-Q: ${question}
-A: [type your answer here]
-    `
-  };
-
-  try {
-    await transporter.sendMail(mailOptions);
-    console.log("Sent unknown-question email to rep");
-  } catch (err) {
-    console.error("Failed to send email", err);
-  }
-}
-
-// API endpoint to trigger unknown question email (guarded)
-app.post('/api/unknown', requireApiKey, express.json(), async (req, res) => {
-  const { question } = req.body;
-  if (!question) return res.status(400).json({ error: 'Missing question' });
-
-  await handleUnknownQuestion(question);
-  res.json({ success: true, sent: true });
-});
-
-// ➕ ADMIN: list entries (Bearer ADMIN_TOKEN)
+// ------------ ADMIN ------------
 app.get('/api/entries', (req, res) => {
   if (!ADMIN_TOKEN || req.headers.authorization !== `Bearer ${ADMIN_TOKEN}`) {
     return res.sendStatus(401);
   }
   const store = loadQA();
-  const items = Object.entries(store).map(([q, a]) => ({
-    q, a, hash: entryHash(q, a)
-  }));
+  const items = Object.entries(store).map(([q, a]) => ({ q, a, hash: entryHash(q, a) }));
   res.json({ entries: items.length, items });
 });
 
-// ➕ ADMIN: delete one by hash (Bear er ADMIN_TOKEN)
 app.post('/api/delete', express.json(), (req, res) => {
   if (!ADMIN_TOKEN || req.headers.authorization !== `Bearer ${ADMIN_TOKEN}`) {
     return res.sendStatus(401);
@@ -357,7 +481,7 @@ app.post('/api/delete', express.json(), (req, res) => {
   res.json({ ok: true, entries: Object.keys(store).length });
 });
 
-// daily archive
+// ------------ DAILY ARCHIVE ------------
 cron.schedule('59 23 * * *', () => {
   try {
     const now = DateTime.now().setZone(TIMEZONE);
@@ -382,9 +506,10 @@ cron.schedule('59 23 * * *', () => {
 
 // first boot
 if (!fs.existsSync(TODAY_PDF)) regeneratePdfFromStore();
+if (!fs.existsSync(PENDING_PATH)) savePending({});
 
 // start
 app.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
-  console.log(`Check: /api/status /public/test.html /test.html /raw-test`);
+  console.log(`Check: /api/status  /public/qa-today.pdf  /api/stream`);
 });
