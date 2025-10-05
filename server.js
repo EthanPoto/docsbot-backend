@@ -15,7 +15,10 @@ const PORT = process.env.PORT || 3000;
 const TIMEZONE = process.env.TIMEZONE || 'America/Indiana/Indianapolis';
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');        // persistent disk mount
 const PUBLIC_DIR = process.env.PUBLIC_DIR || path.join(process.cwd(), 'public');  // static pdfs
-const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+const BASE_URL =
+  process.env.BASE_URL ||
+  process.env.RENDER_EXTERNAL_URL || // Render sets this
+  `http://localhost:${PORT}`;
 const INBOUND_SECRET = process.env.INBOUND_SECRET || ''; // ?secret=... on /inbound
 
 // ensure root dirs
@@ -34,9 +37,10 @@ const upload = multer({ limits: { fieldSize: 1 * 1024 * 1024 } });
 
 // ------------ HELPERS ------------
 function slugDirs(slug) {
-  const base = path.join(DATA_DIR, slug);
+  const safe = String(slug || 'default').toLowerCase().replace(/[^a-z0-9-_]/g, '');
+  const base = path.join(DATA_DIR, safe);
   const archive = path.join(base, 'archive');
-  const publicSlug = path.join(PUBLIC_DIR, slug);
+  const publicSlug = path.join(PUBLIC_DIR, safe);
   const storePath = path.join(base, 'qa_store.json');
   const todayPdf = path.join(publicSlug, 'qa-today.pdf');
 
@@ -44,7 +48,7 @@ function slugDirs(slug) {
   if (!fs.existsSync(archive)) fs.mkdirSync(archive, { recursive: true });
   if (!fs.existsSync(publicSlug)) fs.mkdirSync(publicSlug, { recursive: true });
 
-  return { base, archive, publicSlug, storePath, todayPdf };
+  return { base, archive, publicSlug, storePath, todayPdf, slug: safe };
 }
 
 function loadStore(p) {
@@ -79,7 +83,9 @@ function writeTodayPdf(pdfPath, slug, items) {
     });
   }
   doc.end();
-  stream.on('finish', () => fs.renameSync(tmp, pdfPath));
+  stream.on('finish', () => {
+    try { fs.renameSync(tmp, pdfPath); } catch {}
+  });
 }
 
 function parseQA(text = '') {
@@ -114,6 +120,12 @@ function listSlugs() {
 // ------------ STATIC & BASIC ROUTES ------------
 app.use('/public', express.static(PUBLIC_DIR));
 app.get('/health', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+
+// Fallback health for Render (some templates check /api/status)
+app.get('/api/status', (_req, res) => {
+  res.json({ ok: true, note: 'prefer /health', time: new Date().toISOString() });
+});
+
 app.get('/', (_req, res) => {
   const idx = path.join(PUBLIC_DIR, 'index.html');
   if (fs.existsSync(idx)) return res.sendFile(idx);
@@ -122,9 +134,9 @@ app.get('/', (_req, res) => {
 
 // ------------ PER-COMPANY STATUS ------------
 app.get('/c/:slug/api/status', (req, res) => {
-  const slug = (req.params.slug || '').toLowerCase();
-  if (!slug) return res.status(400).json({ error: 'missing slug' });
-  const { storePath } = slugDirs(slug);
+  const raw = (req.params.slug || '').toLowerCase();
+  if (!raw) return res.status(400).json({ error: 'missing slug' });
+  const { storePath, slug } = slugDirs(raw);
   const store = loadStore(storePath);
   const todayPdfUrl = `${BASE_URL}/public/${encodeURIComponent(slug)}/qa-today.pdf`;
   res.json({ slug, count: store.items.length, todayPdfUrl });
@@ -140,6 +152,7 @@ app.post('/inbound', upload.any(), (req, res) => {
     }
 
     const fields = Object.fromEntries(Object.entries(req.body || {}));
+
     // Derive "to" from envelope JSON (preferred) or fallback to raw "to"
     let toAddr = '';
     try {
@@ -151,7 +164,7 @@ app.post('/inbound', upload.any(), (req, res) => {
 
     // Expect qa@<slug>.replies.yourdomain.com -> slug = subdomain before ".replies"
     const host = (toAddr.split('@')[1] || '').toLowerCase(); // <slug>.replies.yourdomain.com
-    const slug = host.split('.replies')[0] || 'default';
+    const derivedSlug = (host.split('.replies')[0] || 'default').trim();
 
     // Prefer plain text; otherwise convert HTML to text
     const bodyText = (fields.text && fields.text.trim())
@@ -160,13 +173,13 @@ app.post('/inbound', upload.any(), (req, res) => {
 
     const qa = parseQA(bodyText);
     if (!qa) {
-      console.warn('Inbound parse failed (no Q:/A:)', { slug, toAddr });
+      console.warn('Inbound parse failed (no Q:/A:)', { derivedSlug, toAddr });
       // Always 200 to keep SendGrid happy
       return res.status(200).json({ ok: false, error: 'No Q:/A: found' });
     }
 
     // Save to per-company store and regenerate PDF
-    const { storePath, todayPdf } = slugDirs(slug);
+    const { storePath, todayPdf, slug } = slugDirs(derivedSlug);
     const store = loadStore(storePath);
     store.items.push({ q: qa.q, a: qa.a, ts: Date.now(), source: 'email' });
     saveStore(storePath, store);
@@ -230,5 +243,9 @@ cron.schedule('5 0 * * *', () => {
 // ------------ START ------------
 app.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
-  console.log(`Health: /health  Status: /c/:slug/api/status  PDFs under /public/:slug/qa-today.pdf`);
+  console.log(`Health: /health  Status: /api/status  Company status: /c/:slug/api/status  PDFs under /public/:slug/qa-today.pdf`);
 });
+
+// Graceful-ish error logs
+process.on('unhandledRejection', err => console.error('UNHANDLED REJECTION', err));
+process.on('uncaughtException', err => console.error('UNCAUGHT EXCEPTION', err));
