@@ -1,4 +1,4 @@
-// server.js
+// server.js — Multi-tenant Q/A store with per-company PDFs + SendGrid inbound
 console.log('BOOT', { cwd: process.cwd(), node: process.version });
 
 const express = require('express');
@@ -8,77 +8,88 @@ const multer = require('multer');
 const PDFDocument = require('pdfkit');
 const cron = require('node-cron');
 const { DateTime } = require('luxon');
-const crypto = require('crypto');
-const nodemailer = require('nodemailer');
 const cors = require('cors');
 
 // ------------ CONFIG ------------
 const PORT = process.env.PORT || 3000;
-const TIMEZONE = 'America/Indiana/Indianapolis';
-const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
-const PUBLIC_DIR = path.join(process.cwd(), 'public');
-const STORE_PATH = path.join(DATA_DIR, 'qa_store.json');
-const TODAY_PDF = path.join(PUBLIC_DIR, 'qa-today.pdf');
-const PENDING_PATH = path.join(DATA_DIR, 'pending.json');
+const TIMEZONE = process.env.TIMEZONE || 'America/Indiana/Indianapolis';
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');        // persistent disk mount
+const PUBLIC_DIR = process.env.PUBLIC_DIR || path.join(process.cwd(), 'public');  // static pdfs
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+const INBOUND_SECRET = process.env.INBOUND_SECRET || ''; // ?secret=... on /inbound
 
-const INBOUND_SECRET = process.env.INBOUND_SECRET || '';
-const API_KEY = process.env.API_KEY || '';
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
-
-const COMPANY_REP_EMAIL = process.env.REP_EMAIL || 'hello@1stanswerbot.com';
-const REPLY_FROM = process.env.REPLY_FROM || 'hello@1stanswerbot.com';
-
-const TWO_MIN_MS = 2 * 60 * 1000;
-
-// ensure dirs
+// ensure root dirs
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 
 const app = express();
-const ALLOW_ORIGINS = [
-  'https://1stanswerbot.com',
-  'https://www.1stanswerbot.com',
-];
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (ALLOW_ORIGINS.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key, X-API-KEY');
-  }
-  if (req.method === 'OPTIONS') {
-    return res.status(204).end();
-  }
-  next();
-});
-// body parsers + uploads
-app.use(cors({
-  origin: [
-    'https://1stanswerbot.com',
-    'https://www.1stanswerbot.com',
-  ],
-  methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type','x-api-key'],
-}));
-app.options('*', cors());
-app.use(express.json());
+
+// CORS (optional – safe defaults)
+app.use(cors({ origin: true, credentials: false }));
+app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+
+// uploads for inbound
 const upload = multer({ limits: { fieldSize: 1 * 1024 * 1024 } });
 
-// email transport (SendGrid SMTP)
-const transporter = nodemailer.createTransport({
-  host: 'smtp.sendgrid.net',
-  port: 587,
-  auth: { user: 'apikey', pass: process.env.SENDGRID_API_KEY }
-});
+// ------------ HELPERS ------------
+function slugDirs(slug) {
+  const base = path.join(DATA_DIR, slug);
+  const archive = path.join(base, 'archive');
+  const publicSlug = path.join(PUBLIC_DIR, slug);
+  const storePath = path.join(base, 'qa_store.json');
+  const todayPdf = path.join(publicSlug, 'qa-today.pdf');
 
-// ------------ UTILS ------------
-function requireApiKey(req, res, next) {
-  if (!API_KEY) return next();
-  const key = req.headers['x-api-key'];
-  if (key !== API_KEY) return res.status(401).json({ error: 'unauthorized' });
-  next();
+  if (!fs.existsSync(base)) fs.mkdirSync(base, { recursive: true });
+  if (!fs.existsSync(archive)) fs.mkdirSync(archive, { recursive: true });
+  if (!fs.existsSync(publicSlug)) fs.mkdirSync(publicSlug, { recursive: true });
+
+  return { base, archive, publicSlug, storePath, todayPdf };
+}
+
+function loadStore(p) {
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return { items: [] }; }
+}
+function saveStore(p, json) {
+  fs.writeFileSync(p, JSON.stringify(json, null, 2));
+}
+
+function writeTodayPdf(pdfPath, slug, items) {
+  const doc = new PDFDocument({ size: 'LETTER', margin: 40 });
+  const tmp = pdfPath + '.tmp';
+  const stream = fs.createWriteStream(tmp);
+  doc.pipe(stream);
+
+  const ts = DateTime.now().setZone(TIMEZONE).toFormat('yyyy-LL-dd HH:mm');
+  doc.fontSize(18).text(`Q/A — ${slug} (Today)`, { underline: true });
+  doc.moveDown(0.25);
+  doc.fontSize(10).text(`Generated: ${ts} ${TIMEZONE}`);
+  doc.moveDown();
+
+  if (!items.length) {
+    doc.fontSize(12).text('No entries yet for today.');
+  } else {
+    items.forEach((it, i) => {
+      doc.moveDown(0.5);
+      doc.fontSize(13).text(`${i + 1}. Q: ${it.q}`);
+      doc.moveDown(0.2);
+      doc.fontSize(12).text(`   A: ${it.a}`);
+      doc.moveDown(0.4);
+      doc.moveTo(40, doc.y).lineTo(550, doc.y).stroke();
+    });
+  }
+  doc.end();
+  stream.on('finish', () => fs.renameSync(tmp, pdfPath));
+}
+
+function parseQA(text = '') {
+  // First Q: ... A: ... pair (case-insensitive). Plain text expected.
+  const m = String(text).match(/Q:\s*([\s\S]*?)\nA:\s*([\s\S]*)/i);
+  if (!m) return null;
+  const q = m[1].trim();
+  const a = m[2].trim();
+  if (!q || !a) return null;
+  return { q, a };
 }
 
 function htmlToText(html) {
@@ -93,423 +104,131 @@ function htmlToText(html) {
     .trim();
 }
 
-function parseQAFromText(text) {
-  if (!text) return [];
-  const lines = String(text).replace(/\r/g, '').split('\n');
-  const qa = [];
-  let q = null, aBuf = [];
-  const flush = () => {
-    if (q && aBuf.length) {
-      const a = aBuf.join('\n').trim();
-      if (a) qa.push({ q: q.trim(), a });
-    }
-    q = null; aBuf = [];
-  };
-  for (const raw of lines) {
-    const line = raw.trim();
-    const qm = line.match(/^Q[:\-]\s*(.+)$/i);
-    const am = line.match(/^A[:\-]\s*(.*)$/i);
-    if (qm) { flush(); q = qm[1]; continue; }
-    if (am) { aBuf.push(am[1]); continue; }
-    if (q && aBuf.length) aBuf.push(raw);
-  }
-  flush();
-  return qa;
+function listSlugs() {
+  return fs.readdirSync(DATA_DIR).filter(name => {
+    const p = path.join(DATA_DIR, name);
+    try { return fs.statSync(p).isDirectory(); } catch { return false; }
+  });
 }
 
-function entryHash(q, a) {
-  return crypto.createHash('sha256').update(q + '\n' + a).digest('hex');
-}
-
-function genQID() {
-  return crypto.randomBytes(6).toString('hex'); // 12 chars
-}
-
-// ------------ DATA LAYERS ------------
-function loadJSON(p, fallback) {
-  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fallback; }
-}
-function saveJSON(p, obj) {
-  fs.writeFileSync(p, JSON.stringify(obj, null, 2));
-}
-
-function loadQA() { return loadJSON(STORE_PATH, {}); }
-function saveQA(data) { saveJSON(STORE_PATH, data); }
-function loadPending() { return loadJSON(PENDING_PATH, {}); }
-function savePending(data) { saveJSON(PENDING_PATH, data); }
-
-function cleanAnswer(a) {
-  if (typeof a === 'string') return a;
-  if (a == null) return '';
-  return JSON.stringify(a);
-}
-
-function regeneratePdfFromStore() {
-  const store = loadQA();
-  const doc = new PDFDocument({ margin: 40 });
-  const tmp = TODAY_PDF + '.tmp';
-
-  const stream = fs.createWriteStream(tmp);
-  doc.pipe(stream);
-
-  const zoneNow = DateTime.now().setZone(TIMEZONE).toFormat('yyyy-LL-dd HH:mm');
-  doc.fontSize(18).text('Q&A – Today', { underline: true });
-  doc.moveDown(0.5);
-  doc.fontSize(10).text(`Generated: ${zoneNow} ${TIMEZONE}`);
-  doc.moveDown();
-
-  const entries = Object.entries(store);
-  if (entries.length === 0) {
-    doc.fontSize(12).text('No entries yet.');
-  } else {
-    for (const [q, a] of entries) {
-      doc.moveDown(0.5);
-      doc.fontSize(14).text('Q: ' + q);
-      doc.moveDown(0.25);
-      doc.fontSize(12).text('A: ' + cleanAnswer(a));
-      doc.moveDown(0.75);
-      doc.moveTo(40, doc.y).lineTo(555, doc.y).stroke();
-    }
-  }
-
-  doc.end();
-  stream.on('finish', () => fs.renameSync(tmp, TODAY_PDF));
-}
-
-// ------------ SSE ------------
-const clients = new Set();
-function broadcast(event, data) {
-  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const res of clients) res.write(payload);
-}
-
-// ------------ LOGGER / STATIC ------------
-app.use((req, _res, next) => { console.log(req.method, req.url); next(); });
+// ------------ STATIC & BASIC ROUTES ------------
 app.use('/public', express.static(PUBLIC_DIR));
-app.use(express.static(PUBLIC_DIR));
-
+app.get('/health', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 app.get('/', (_req, res) => {
-  // prefer index.html if it exists, fallback to a tiny page
   const idx = path.join(PUBLIC_DIR, 'index.html');
   if (fs.existsSync(idx)) return res.sendFile(idx);
-  res.type('html').send('<h1>DocsBot Backend</h1><p>OK</p>');
+  res.type('html').send('<h1>DocsBot Backend (multi-tenant)</h1><p>OK</p>');
 });
 
-app.get('/raw-test', (_req, res) => {
-  res.type('html').send('<h1>RAW OK</h1><p>No cache</p>');
+// ------------ PER-COMPANY STATUS ------------
+app.get('/c/:slug/api/status', (req, res) => {
+  const slug = (req.params.slug || '').toLowerCase();
+  if (!slug) return res.status(400).json({ error: 'missing slug' });
+  const { storePath } = slugDirs(slug);
+  const store = loadStore(storePath);
+  const todayPdfUrl = `${BASE_URL}/public/${encodeURIComponent(slug)}/qa-today.pdf`;
+  res.json({ slug, count: store.items.length, todayPdfUrl });
 });
 
-app.get('/api/stream', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders();
-  clients.add(res);
-  req.on('close', () => clients.delete(res));
-});
-
-// ------------ CORE EMAIL FLOW ------------
-
-// Email to rep for unknown question
-async function emailRepAboutUnknown(question, qid) {
-  const subject = `New unanswered question [QID:${qid}]`;
-  const text = `
-We received this question:
-
-Q: ${question}
-
-Please REPLY to this email with the following format so the bot can learn:
-
-Q: ${question}
-A: [type your answer here]
-
-(Keep [QID:${qid}] in the subject)
-  `.trim();
-
-  const mailOptions = {
-    from: REPLY_FROM,
-    to: COMPANY_REP_EMAIL,
-    replyTo: process.env.INBOUND_REPLY_TO || 'qa@replies.1stanswerbot.com',
-    subject,
-    text
-  };
-
-  await transporter.sendMail(mailOptions);
-  console.log('Sent unknown-question email to rep', { to: COMPANY_REP_EMAIL, qid });
-}
-
-// Create pending ticket and email rep
-async function createPendingAndNotify(question, userEmail = null) {
-  const pending = loadPending();
-  const qid = genQID();
-  const now = Date.now();
-
-  pending[qid] = {
-    qid,
-    question,
-    createdAt: now,
-    userEmail: userEmail || null,
-    answeredAt: null
-  };
-  savePending(pending);
-
-  await emailRepAboutUnknown(question, qid);
-
-  return { qid, expiresAt: now + TWO_MIN_MS };
-}
-
-// On answer received (from inbound), decide realtime vs email
-async function handleAnswerDelivery({ qid, question, answer }) {
-  // Always save to store + PDF
-  const store = loadQA();
-  store[question] = answer;
-  saveQA(store);
-  regeneratePdfFromStore();
-
-  const pending = loadPending();
-  const ticket = pending[qid];
-
-  if (!ticket) {
-    console.log('Answer received for unknown QID; saved to store/PDF only', { qid });
-    return { delivered: 'store_only' };
-  }
-
-  const now = Date.now();
-  ticket.answeredAt = now;
-  savePending(pending);
-
-  const within2min = now - ticket.createdAt <= TWO_MIN_MS;
-
-  if (within2min) {
-    // realtime push to chat
-    broadcast('qa:answer', { qid, question, answer, pdf: '/public/qa-today.pdf' });
-    console.log('Pushed realtime answer to chat', { qid });
-    return { delivered: 'chat' };
-  }
-
-  // outside 2 min: email user if we have their email
-  if (ticket.userEmail) {
-    try {
-      await transporter.sendMail({
-        from: REPLY_FROM,
-        to: ticket.userEmail,
-        subject: `Answer to your question`,
-        text: `Q: ${question}\nA: ${answer}\n\nA PDF copy is available here: /public/qa-today.pdf`
-      });
-      console.log('Emailed user answer (outside 2min)', { qid, to: ticket.userEmail });
-      return { delivered: 'email_user' };
-    } catch (e) {
-      console.error('Failed emailing user answer', e);
-      return { delivered: 'email_user_failed' };
-    }
-  }
-
-  console.log('No user email on file; saved to store/PDF only', { qid });
-  return { delivered: 'store_only' };
-}
-
-// ------------ API: Unknown & Email capture ------------
-
-// Trigger unknown flow (chatbot calls this)
-app.post('/api/unknown', requireApiKey, async (req, res) => {
+// ------------ INBOUND (SendGrid Inbound Parse) ------------
+app.post('/inbound', upload.any(), (req, res) => {
   try {
-    const { question, userEmail } = req.body || {};
-    if (!question) return res.status(400).json({ error: 'Missing question' });
-
-    const { qid, expiresAt } = await createPendingAndNotify(question, userEmail || null);
-
-    // Tell chat whether to wait or fall back
-    res.json({
-      success: true,
-      qid,
-      expiresAt,
-      waitMs: TWO_MIN_MS,
-      message: 'Question sent to a human. If they reply within 2 minutes, you’ll see the answer here. Otherwise we’ll email you when it’s ready.'
-    });
-  } catch (e) {
-    console.error('unknown flow error', e);
-    res.status(500).json({ error: 'unknown flow failed' });
-  }
-});
-
-// If chat needs to attach an email later (after showing the “we’ll email you” prompt)
-app.post('/api/pending/:qid/email', requireApiKey, (req, res) => {
-  const { qid } = req.params;
-  const { userEmail } = req.body || {};
-  if (!userEmail) return res.status(400).json({ error: 'Missing userEmail' });
-
-  const pending = loadPending();
-  if (!pending[qid]) return res.status(404).json({ error: 'Unknown qid' });
-
-  pending[qid].userEmail = userEmail;
-  savePending(pending);
-  res.json({ success: true });
-});
-
-// ------------ INBOUND (SendGrid) ------------
-
-app.post('/inbound', upload.any(), async (req, res) => {
-  try {
-    // optional secret check
+    // Optional shared secret
     if (INBOUND_SECRET) {
       const sent = (req.query.secret || req.headers['x-inbound-secret'] || '').toString();
       if (sent !== INBOUND_SECRET) return res.status(403).send('forbidden');
     }
 
-    const payload = {
-      from: req.body.from,
-      to: req.body.to,
-      subject: req.body.subject || '',
-      text: req.body.text,
-      html: req.body.html,
-      envelope: req.body.envelope
-    };
-
-    console.log('Inbound email:', { from: payload.from, to: payload.to, subject: payload.subject });
-
-    // persist inbound for debugging
-    fs.writeFileSync(
-      path.join(DATA_DIR, `inbound_${Date.now()}.json`),
-      JSON.stringify(payload, null, 2)
-    );
-
-    const textBody = (payload.text && payload.text.trim()) ? payload.text : htmlToText(payload.html);
-    const parsed = parseQAFromText(textBody);
-
-    if (!parsed.length) {
-      console.warn('Inbound parse failed (no Q:/A:)');
-      return res.status(200).json({ ok: false, error: 'Bad format. Use "Q: ...\\nA: ..."' });
+    const fields = Object.fromEntries(Object.entries(req.body || {}));
+    // Derive "to" from envelope JSON (preferred) or fallback to raw "to"
+    let toAddr = '';
+    try {
+      const env = JSON.parse(fields.envelope || '{}');
+      toAddr = (env.to && env.to[0]) || fields.to || '';
+    } catch {
+      toAddr = fields.to || '';
     }
 
-    // Try to extract QID from subject like [QID:abcdef123456]
-    const qidMatch = (payload.subject || '').match(/\[QID:([a-f0-9]{12})\]/i);
-    const qidFromSubject = qidMatch ? qidMatch[1] : null;
+    // Expect qa@<slug>.replies.yourdomain.com -> slug = subdomain before ".replies"
+    const host = (toAddr.split('@')[1] || '').toLowerCase(); // <slug>.replies.yourdomain.com
+    const slug = host.split('.replies')[0] || 'default';
 
-    // handle each Q/A found (usually 1)
-    for (const { q, a } of parsed) {
-      let chosenQID = qidFromSubject;
+    // Prefer plain text; otherwise convert HTML to text
+    const bodyText = (fields.text && fields.text.trim())
+      ? fields.text
+      : htmlToText(fields.html || '');
 
-      // If no QID in subject, try to match by exact question against pending
-      if (!chosenQID) {
-        const pending = loadPending();
-        for (const t of Object.values(pending)) {
-          if (t.question && t.question.trim() === q.trim()) {
-            chosenQID = t.qid;
-            break;
-          }
-        }
-      }
-
-      const result = await handleAnswerDelivery({
-        qid: chosenQID || genQID(), // fall back: still save to store/PDF
-        question: q,
-        answer: a
-      });
-
-      console.log('Inbound handled', { qid: chosenQID, delivery: result.delivered });
+    const qa = parseQA(bodyText);
+    if (!qa) {
+      console.warn('Inbound parse failed (no Q:/A:)', { slug, toAddr });
+      // Always 200 to keep SendGrid happy
+      return res.status(200).json({ ok: false, error: 'No Q:/A: found' });
     }
 
-    res.status(200).json({ ok: true, parsed: parsed.length });
+    // Save to per-company store and regenerate PDF
+    const { storePath, todayPdf } = slugDirs(slug);
+    const store = loadStore(storePath);
+    store.items.push({ q: qa.q, a: qa.a, ts: Date.now(), source: 'email' });
+    saveStore(storePath, store);
+    writeTodayPdf(todayPdf, slug, store.items);
+
+    // (Optional) persist raw inbound for debugging
+    try {
+      const dbg = {
+        to: toAddr,
+        subject: fields.subject || '',
+        receivedAt: new Date().toISOString(),
+        parsed: qa
+      };
+      fs.writeFileSync(
+        path.join(DATA_DIR, slug, `inbound_${Date.now()}.json`),
+        JSON.stringify(dbg, null, 2)
+      );
+    } catch {}
+
+    return res.status(200).json({ ok: true, slug, added: 1 });
   } catch (err) {
     console.error('Inbound error:', err);
-    // keep 200 for SendGrid; mark ok:false for logs
-    res.status(200).json({ ok: false, error: 'inbound exception' });
+    // Return 200 so SendGrid doesn’t retry endlessly
+    return res.status(200).json({ ok: false, error: 'inbound exception' });
   }
 });
 
-// ------------ Q/A CRUD & STATUS ------------
-app.get('/api/status', (_req, res) => {
-  const store = loadQA();
-  res.json({ ok: true, entries: Object.keys(store).length, pdf: '/public/qa-today.pdf' });
-});
-
-app.post('/api/qa', upload.none(), (req, res) => {
-  const { question, answer } = req.body;
-  if (!question || !answer) return res.status(400).json({ error: 'Missing question or answer' });
-
-  const store = loadQA();
-  if (store[question] && String(store[question]).trim() === String(answer).trim()) {
-    return res.json({ success: true, dedup: true, pdf: '/public/qa-today.pdf' });
-  }
-
-  store[question] = answer;
-  saveQA(store);
-  regeneratePdfFromStore();
-
-  const payload = { question, answer, pdf: '/public/qa-today.pdf' };
-  broadcast('qa:new', payload);
-  res.json({ success: true, ...payload });
-});
-
-app.get('/api/qa/:question', (req, res) => {
-  const store = loadQA();
-  const ans = store[req.params.question];
-  if (!ans) return res.status(404).json({ error: 'Not found' });
-  res.json({ answer: cleanAnswer(ans), pdf: '/public/qa-today.pdf' });
-});
-
-// ------------ ADMIN ------------
-app.get('/api/entries', (req, res) => {
-  if (!ADMIN_TOKEN || req.headers.authorization !== `Bearer ${ADMIN_TOKEN}`) {
-    return res.sendStatus(401);
-  }
-  const store = loadQA();
-  const items = Object.entries(store).map(([q, a]) => ({ q, a, hash: entryHash(q, a) }));
-  res.json({ entries: items.length, items });
-});
-
-app.post('/api/delete', express.json(), (req, res) => {
-  if (!ADMIN_TOKEN || req.headers.authorization !== `Bearer ${ADMIN_TOKEN}`) {
-    return res.sendStatus(401);
-  }
-  const { hash } = req.body || {};
-  if (!hash) return res.status(400).json({ ok: false, error: 'hash required' });
-
-  const store = loadQA();
-  let found = false;
-  for (const [q, a] of Object.entries(store)) {
-    if (entryHash(q, a) === hash) {
-      delete store[q];
-      found = true;
-      break;
-    }
-  }
-  if (!found) return res.status(404).json({ ok: false, error: 'not found' });
-
-  saveQA(store);
-  regeneratePdfFromStore();
-  res.json({ ok: true, entries: Object.keys(store).length });
-});
-
-// ------------ DAILY ARCHIVE ------------
-cron.schedule('59 23 * * *', () => {
+// ------------ NIGHTLY ARCHIVE/RESET (per company) ------------
+cron.schedule('5 0 * * *', () => {
   try {
-    const now = DateTime.now().setZone(TIMEZONE);
-    const dateStr = now.toFormat('yyyy-LL-dd');
-
-    const archiveDir = path.join(DATA_DIR, 'archive');
-    if (!fs.existsSync(archiveDir)) fs.mkdirSync(archiveDir, { recursive: true });
-
-    if (fs.existsSync(TODAY_PDF)) {
-      const dst = path.join(archiveDir, `qa-${dateStr}.pdf`);
-      fs.copyFileSync(TODAY_PDF, dst);
-      console.log('Archived PDF', { dst });
-    }
-
-    saveQA({});
-    regeneratePdfFromStore();
-    broadcast('qa:rollover', { pdf: '/public/qa-today.pdf', date: dateStr });
+    const zone = TIMEZONE;
+    const day = DateTime.now().setZone(zone).toFormat('yyyy-LL-dd');
+    const slugs = listSlugs();
+    slugs.forEach(slug => {
+      const { storePath, archive, todayPdf } = slugDirs(slug);
+      // copy today PDF to archive
+      if (fs.existsSync(todayPdf)) {
+        const out = path.join(archive, `qa-${day}.pdf`);
+        fs.copyFileSync(todayPdf, out);
+        console.log('Archived PDF', { slug, out });
+      }
+      // reset today's store and PDF
+      saveStore(storePath, { items: [] });
+      writeTodayPdf(todayPdf, slug, []);
+    });
   } catch (e) {
     console.error('Archive job failed', e);
   }
 }, { timezone: TIMEZONE });
 
-// first boot
-if (!fs.existsSync(TODAY_PDF)) regeneratePdfFromStore();
-if (!fs.existsSync(PENDING_PATH)) savePending({});
+// ------------ BOOTSTRAP ------------
+(function ensureBootPdfs() {
+  // Create an empty "today" PDF for any existing slugs on boot
+  listSlugs().forEach(slug => {
+    const { storePath, todayPdf } = slugDirs(slug);
+    const store = loadStore(storePath);
+    writeTodayPdf(todayPdf, slug, store.items || []);
+  });
+})();
 
-// start
+// ------------ START ------------
 app.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
-  console.log(`Check: /api/status  /public/qa-today.pdf  /api/stream`);
+  console.log(`Health: /health  Status: /c/:slug/api/status  PDFs under /public/:slug/qa-today.pdf`);
 });
