@@ -91,8 +91,9 @@ function writeTodayPdf(pdfPath, slug, items) {
 
 // Accepts either "Q: ...\nA: ..." or just "Q: ..." (A optional)
 function parseQARelaxed(text = '') {
-  const s = String(text);
-  const m = s.match(/Q:\s*([\s\S]*?)(?:\nA:\s*([\s\S]*))?$/i);
+  const s = String(text || '');
+  // Try strict first (explicit A:)
+  let m = s.match(/Q:\s*([\s\S]*?)(?:\nA:\s*([\s\S]*))?$/i);
   if (!m) return null;
   const q = (m[1] || '').trim();
   const a = (m[2] || '').trim();
@@ -178,21 +179,26 @@ app.get('/c/:slug/api/status', (req, res) => {
 
 // ------------ INBOUND (SendGrid Inbound Parse) ------------
 app.post('/inbound', upload.any(), (req, res) => {
+  const debug = req.query.debug === '1';
   try {
     // Header-only shared secret
     if (INBOUND_SECRET) {
-      const sent = (req.headers['x-inbound-secret'] || '').toString();
-      if (sent !== INBOUND_SECRET) return res.status(403).send('forbidden');
+      const sent = String(req.get('x-inbound-secret') || '');
+      if (sent !== INBOUND_SECRET) {
+        return res.status(403).json({ ok: false, error: 'forbidden' });
+      }
     }
 
-    const fields = Object.fromEntries(Object.entries(req.body || {}));
+    // Multer puts fields on req.body
+    const fields = req.body || {};
 
     // Derive "to" from envelope JSON (preferred) or fallback to raw "to"
     let toAddr = '';
     try {
-      const env = JSON.parse(fields.envelope || '{}');
-      // Some providers send "to" as array
-      toAddr = (Array.isArray(env.to) ? env.to[0] : env.to) || fields.to || '';
+      const envRaw = fields.envelope;
+      const env = typeof envRaw === 'string' ? JSON.parse(envRaw) : (envRaw || {});
+      const envTo = Array.isArray(env.to) ? env.to[0] : env.to;
+      toAddr = envTo || fields.to || '';
     } catch {
       toAddr = fields.to || '';
     }
@@ -200,30 +206,17 @@ app.post('/inbound', upload.any(), (req, res) => {
     const derivedSlug = deriveSlugFromAddress(toAddr);
 
     // Prefer plain text; otherwise convert HTML to text
-    const bodyText = (fields.text && fields.text.trim())
-      ? fields.text
-      : htmlToText(fields.html || '');
+    const textField = typeof fields.text === 'string' ? fields.text : '';
+    const htmlField = typeof fields.html === 'string' ? fields.html : '';
+    const bodyText = (textField && textField.trim()) ? textField : htmlToText(htmlField);
 
-    function parseQA(text = '') {
-  const t = String(text || '');
-
-  // Find first Q: and first A: anywhere (case-insensitive)
-  const qMatch = t.match(/^\s*Q:\s*(.+)$/im);
-  const aMatch = t.match(/^\s*A:\s*([\s\S]+)$/im);
-  if (!qMatch || !aMatch) return null;
-
-  let q = (qMatch[1] || '').trim();
-  let a = (aMatch[1] || '');
-
-  // Stop A: at common reply/quote markers or another Q:
-  const cutAt = a.search(/^\s*(Q:|On .* wrote:|From:|Sent:|-----|>)/im);
-  if (cutAt > -1) a = a.slice(0, cutAt);
-
-  a = a.trim();
-  if (!q || !a) return null;
-
-  return { q, a };
-}
+    const qa = parseQARelaxed(bodyText);
+    if (!qa) {
+      const payload = { ok: false, error: 'No Q:/A: found' };
+      if (debug) Object.assign(payload, { toAddr, derivedSlug, bodyTextSample: bodyText.slice(0, 200) });
+      // Always 200 so inbound providers don't retry forever
+      return res.status(200).json(payload);
+    }
 
     // Save to per-company store and regenerate PDF
     const { storePath, todayPdf, slug } = slugDirs(derivedSlug);
@@ -255,6 +248,9 @@ app.post('/inbound', upload.any(), (req, res) => {
     return res.status(200).json({ ok: true, slug, added: 1, pending: !qa.hasA });
   } catch (err) {
     console.error('Inbound error:', err);
+    if (debug) {
+      return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    }
     // Return 200 so SendGrid doesn’t retry endlessly
     return res.status(200).json({ ok: false, error: 'inbound exception' });
   }
