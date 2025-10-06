@@ -19,7 +19,7 @@ const BASE_URL =
   process.env.BASE_URL ||
   process.env.RENDER_EXTERNAL_URL || // Render sets this
   `http://localhost:${PORT}`;
-const INBOUND_SECRET = process.env.INBOUND_SECRET || ''; // must be in header x-inbound-secret
+const INBOUND_SECRET = process.env.INBOUND_SECRET || ''; // header x-inbound-secret OR ?secret=...
 
 // ensure root dirs
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -92,11 +92,19 @@ function writeTodayPdf(pdfPath, slug, items) {
 // Accepts either "Q: ...\nA: ..." or just "Q: ..." (A optional)
 function parseQARelaxed(text = '') {
   const s = String(text || '');
-  // Try strict first (explicit A:)
-  let m = s.match(/Q:\s*([\s\S]*?)(?:\nA:\s*([\s\S]*))?$/i);
+  // Find first Q: and optional A: later in the string (case-insensitive)
+  const m = s.match(/Q:\s*([\s\S]*?)(?:\nA:\s*([\s\S]*))?$/i);
   if (!m) return null;
+
   const q = (m[1] || '').trim();
-  const a = (m[2] || '').trim();
+  let a = (m[2] || '').trim();
+
+  // If we captured an A:, cut it off at common quoted-reply markers / next Q:
+  if (a) {
+    const cutAt = a.search(/^\s*(Q:|On .* wrote:|From:|Sent:|-----|>)/im);
+    if (cutAt > -1) a = a.slice(0, cutAt).trim();
+  }
+
   if (!q) return null;
   return { q, a, hasA: Boolean(a) };
 }
@@ -153,7 +161,18 @@ function deriveSlugFromAddress(toAddrRaw = '') {
 }
 
 // ------------ STATIC & BASIC ROUTES ------------
-app.use('/public', express.static(PUBLIC_DIR));
+// Add no-store for the "today" PDF to avoid stale cache
+app.use('/public', express.static(PUBLIC_DIR, {
+  etag: false,
+  lastModified: true,
+  maxAge: 0,
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('qa-today.pdf')) {
+      res.setHeader('Cache-Control', 'no-store');
+    }
+  }
+}));
+
 app.get('/health', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
 // Fallback health for Render (some templates check /api/status)
@@ -179,26 +198,25 @@ app.get('/c/:slug/api/status', (req, res) => {
 
 // ------------ INBOUND (SendGrid Inbound Parse) ------------
 app.post('/inbound', upload.any(), (req, res) => {
-  const debug = req.query.debug === '1';
   try {
-    // Header-only shared secret
+    // Shared secret — accept header OR query (SendGrid can't add custom headers)
     if (INBOUND_SECRET) {
-      const sent = String(req.get('x-inbound-secret') || '');
-      if (sent !== INBOUND_SECRET) {
-        return res.status(403).json({ ok: false, error: 'forbidden' });
+      const h = (req.headers['x-inbound-secret'] || '').toString();
+      const q = (req.query.secret || '').toString();
+      if (h !== INBOUND_SECRET && q !== INBOUND_SECRET) {
+        console.warn('Inbound forbidden: bad secret', { hasHeader: Boolean(h), hasQuery: Boolean(q) });
+        return res.status(403).send('forbidden');
       }
     }
 
-    // Multer puts fields on req.body
-    const fields = req.body || {};
+    const fields = Object.fromEntries(Object.entries(req.body || {}));
 
     // Derive "to" from envelope JSON (preferred) or fallback to raw "to"
     let toAddr = '';
     try {
-      const envRaw = fields.envelope;
-      const env = typeof envRaw === 'string' ? JSON.parse(envRaw) : (envRaw || {});
-      const envTo = Array.isArray(env.to) ? env.to[0] : env.to;
-      toAddr = envTo || fields.to || '';
+      const env = JSON.parse(fields.envelope || '{}');
+      // Some providers send "to" as array
+      toAddr = (Array.isArray(env.to) ? env.to[0] : env.to) || fields.to || '';
     } catch {
       toAddr = fields.to || '';
     }
@@ -206,16 +224,15 @@ app.post('/inbound', upload.any(), (req, res) => {
     const derivedSlug = deriveSlugFromAddress(toAddr);
 
     // Prefer plain text; otherwise convert HTML to text
-    const textField = typeof fields.text === 'string' ? fields.text : '';
-    const htmlField = typeof fields.html === 'string' ? fields.html : '';
-    const bodyText = (textField && textField.trim()) ? textField : htmlToText(htmlField);
+    const bodyText = (fields.text && fields.text.trim())
+      ? fields.text
+      : htmlToText(fields.html || '');
 
     const qa = parseQARelaxed(bodyText);
     if (!qa) {
-      const payload = { ok: false, error: 'No Q:/A: found' };
-      if (debug) Object.assign(payload, { toAddr, derivedSlug, bodyTextSample: bodyText.slice(0, 200) });
-      // Always 200 so inbound providers don't retry forever
-      return res.status(200).json(payload);
+      console.warn('Inbound parse failed (no Q:/A:)', { derivedSlug, toAddr });
+      // Always 200 to keep SendGrid happy
+      return res.status(200).json({ ok: false, error: 'No Q:/A: found' });
     }
 
     // Save to per-company store and regenerate PDF
@@ -237,7 +254,7 @@ app.post('/inbound', upload.any(), (req, res) => {
         to: toAddr,
         subject: fields.subject || '',
         receivedAt: new Date().toISOString(),
-        parsed: { q: qa.q, a: qa.a, hasA: qa.hasA }
+        parsed: { q: qa.q, a: qa.a || '', hasA: qa.hasA }
       };
       fs.writeFileSync(
         path.join(DATA_DIR, slug, `inbound_${Date.now()}.json`),
@@ -248,9 +265,6 @@ app.post('/inbound', upload.any(), (req, res) => {
     return res.status(200).json({ ok: true, slug, added: 1, pending: !qa.hasA });
   } catch (err) {
     console.error('Inbound error:', err);
-    if (debug) {
-      return res.status(500).json({ ok: false, error: String(err?.message || err) });
-    }
     // Return 200 so SendGrid doesn’t retry endlessly
     return res.status(200).json({ ok: false, error: 'inbound exception' });
   }
