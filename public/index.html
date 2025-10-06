@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>DocsBot Admin</title>
+<h1>DocsBot Admin</h1>
+
+<p><a href="/public/qa-today.pdf" target="_blank">Open today’s PDF</a></p>
+
+<form id="f" style="margin:16px 0;">
+  <div>
+    <label>Question</label><br>
+    <input id="q" required style="width:360px;">
+  </div>
+  <div style="margin-top:8px;">
+    <label>Answer</label><br>
+    <input id="a" required style="width:360px;">
+  </div>
+  <button style="margin-top:12px;">Add</button>
+</form>
+
+<pre id="out" style="background:#111;color:#eee;padding:8px;"></pre>
+
+<script>
+const f = document.getElementById('f');
+const q = document.getElementById('q');
+const a = document.getElementById('a');
+const out = document.getElementById('out');
+
+f.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  out.textContent = 'Submitting...';
+  try {
+    const r = await fetch('/api/qa', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: q.value, answer: a.value })
+    });
+    const j = await r.json();
+    out.textContent = JSON.stringify(j, null, 2);
+  } catch (err) {
+    out.textContent = 'Error: ' + err.message;
+  }
+});
+</script>

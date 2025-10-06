@@ -1,0 +1,6 @@
+{
+  "from": "Rep <rep@example.com>",
+  "to": "test@replies.1stanswerbot.com",
+  "subject": "Answer for hours",
+  "text": "Q: What are your hours?\nA: 9 to 5, Monday to Friday"
+}

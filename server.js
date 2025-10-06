@@ -19,7 +19,7 @@ const BASE_URL =
   process.env.BASE_URL ||
   process.env.RENDER_EXTERNAL_URL || // Render sets this
   `http://localhost:${PORT}`;
-const INBOUND_SECRET = process.env.INBOUND_SECRET || ''; // ?secret=... on /inbound
+const INBOUND_SECRET = process.env.INBOUND_SECRET || ''; // must be in header x-inbound-secret
 
 // ensure root dirs
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -74,10 +74,11 @@ function writeTodayPdf(pdfPath, slug, items) {
     doc.fontSize(12).text('No entries yet for today.');
   } else {
     items.forEach((it, i) => {
+      const ans = (it.a && String(it.a).trim()) ? it.a : '(pending)';
       doc.moveDown(0.5);
       doc.fontSize(13).text(`${i + 1}. Q: ${it.q}`);
       doc.moveDown(0.2);
-      doc.fontSize(12).text(`   A: ${it.a}`);
+      doc.fontSize(12).text(`   A: ${ans}`);
       doc.moveDown(0.4);
       doc.moveTo(40, doc.y).lineTo(550, doc.y).stroke();
     });
@@ -88,14 +89,15 @@ function writeTodayPdf(pdfPath, slug, items) {
   });
 }
 
-function parseQA(text = '') {
-  // First Q: ... A: ... pair (case-insensitive). Plain text expected.
-  const m = String(text).match(/Q:\s*([\s\S]*?)\nA:\s*([\s\S]*)/i);
+// Accepts either "Q: ...\nA: ..." or just "Q: ..." (A optional)
+function parseQARelaxed(text = '') {
+  const s = String(text);
+  const m = s.match(/Q:\s*([\s\S]*?)(?:\nA:\s*([\s\S]*))?$/i);
   if (!m) return null;
-  const q = m[1].trim();
-  const a = m[2].trim();
-  if (!q || !a) return null;
-  return { q, a };
+  const q = (m[1] || '').trim();
+  const a = (m[2] || '').trim();
+  if (!q) return null;
+  return { q, a, hasA: Boolean(a) };
 }
 
 function htmlToText(html) {
@@ -115,6 +117,38 @@ function listSlugs() {
     const p = path.join(DATA_DIR, name);
     try { return fs.statSync(p).isDirectory(); } catch { return false; }
   });
+}
+
+/**
+ * Derive a tenant slug from a "to" address.
+ * Supports:
+ *   1) Plus addressing: qa+<slug>@replies.yourdomain.com
+ *   2) Subdomain style:  qa@<slug>.replies.yourdomain.com
+ */
+function deriveSlugFromAddress(toAddrRaw = '') {
+  if (!toAddrRaw) return 'default';
+
+  // If multiple addresses, pick first.
+  let toAddr = String(toAddrRaw).split(',')[0].trim();
+  // If address is in the form "Name <addr>", extract inside <>
+  const mAngle = toAddr.match(/<([^>]+)>/);
+  if (mAngle) toAddr = mAngle[1];
+
+  const [local, host] = String(toAddr).split('@');
+
+  // Try plus-addressing first: qa+<slug>@replies...
+  const plus = (local || '').match(/^[^+]+?\+([a-z0-9][a-z0-9-_]{0,63})$/i);
+  if (plus) {
+    return plus[1].toLowerCase().replace(/[^a-z0-9-_]/g, '') || 'default';
+  }
+
+  // Fallback: <slug>.replies.<domain>
+  const mHost = (host || '').toLowerCase().match(/^([a-z0-9][a-z0-9-_]{0,63})\.replies\./i);
+  if (mHost) {
+    return mHost[1].replace(/[^a-z0-9-_]/g, '') || 'default';
+  }
+
+  return 'default';
 }
 
 // ------------ STATIC & BASIC ROUTES ------------
@@ -145,9 +179,9 @@ app.get('/c/:slug/api/status', (req, res) => {
 // ------------ INBOUND (SendGrid Inbound Parse) ------------
 app.post('/inbound', upload.any(), (req, res) => {
   try {
-    // Optional shared secret
+    // Header-only shared secret
     if (INBOUND_SECRET) {
-      const sent = (req.query.secret || req.headers['x-inbound-secret'] || '').toString();
+      const sent = (req.headers['x-inbound-secret'] || '').toString();
       if (sent !== INBOUND_SECRET) return res.status(403).send('forbidden');
     }
 
@@ -157,31 +191,50 @@ app.post('/inbound', upload.any(), (req, res) => {
     let toAddr = '';
     try {
       const env = JSON.parse(fields.envelope || '{}');
-      toAddr = (env.to && env.to[0]) || fields.to || '';
+      // Some providers send "to" as array
+      toAddr = (Array.isArray(env.to) ? env.to[0] : env.to) || fields.to || '';
     } catch {
       toAddr = fields.to || '';
     }
 
-    // Expect qa@<slug>.replies.yourdomain.com -> slug = subdomain before ".replies"
-    const host = (toAddr.split('@')[1] || '').toLowerCase(); // <slug>.replies.yourdomain.com
-    const derivedSlug = (host.split('.replies')[0] || 'default').trim();
+    const derivedSlug = deriveSlugFromAddress(toAddr);
 
     // Prefer plain text; otherwise convert HTML to text
     const bodyText = (fields.text && fields.text.trim())
       ? fields.text
       : htmlToText(fields.html || '');
 
-    const qa = parseQA(bodyText);
-    if (!qa) {
-      console.warn('Inbound parse failed (no Q:/A:)', { derivedSlug, toAddr });
-      // Always 200 to keep SendGrid happy
-      return res.status(200).json({ ok: false, error: 'No Q:/A: found' });
-    }
+    function parseQA(text = '') {
+  const t = String(text || '');
+
+  // Find first Q: and first A: anywhere (case-insensitive)
+  const qMatch = t.match(/^\s*Q:\s*(.+)$/im);
+  const aMatch = t.match(/^\s*A:\s*([\s\S]+)$/im);
+  if (!qMatch || !aMatch) return null;
+
+  let q = (qMatch[1] || '').trim();
+  let a = (aMatch[1] || '');
+
+  // Stop A: at common reply/quote markers or another Q:
+  const cutAt = a.search(/^\s*(Q:|On .* wrote:|From:|Sent:|-----|>)/im);
+  if (cutAt > -1) a = a.slice(0, cutAt);
+
+  a = a.trim();
+  if (!q || !a) return null;
+
+  return { q, a };
+}
 
     // Save to per-company store and regenerate PDF
     const { storePath, todayPdf, slug } = slugDirs(derivedSlug);
     const store = loadStore(storePath);
-    store.items.push({ q: qa.q, a: qa.a, ts: Date.now(), source: 'email' });
+    store.items.push({
+      q: qa.q,
+      a: qa.hasA ? qa.a : '',
+      status: qa.hasA ? 'answered' : 'pending',
+      ts: Date.now(),
+      source: 'email'
+    });
     saveStore(storePath, store);
     writeTodayPdf(todayPdf, slug, store.items);
 
@@ -191,7 +244,7 @@ app.post('/inbound', upload.any(), (req, res) => {
         to: toAddr,
         subject: fields.subject || '',
         receivedAt: new Date().toISOString(),
-        parsed: qa
+        parsed: { q: qa.q, a: qa.a, hasA: qa.hasA }
       };
       fs.writeFileSync(
         path.join(DATA_DIR, slug, `inbound_${Date.now()}.json`),
@@ -199,7 +252,7 @@ app.post('/inbound', upload.any(), (req, res) => {
       );
     } catch {}
 
-    return res.status(200).json({ ok: true, slug, added: 1 });
+    return res.status(200).json({ ok: true, slug, added: 1, pending: !qa.hasA });
   } catch (err) {
     console.error('Inbound error:', err);
     // Return 200 so SendGrid doesn’t retry endlessly

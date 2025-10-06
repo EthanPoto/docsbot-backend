@@ -1,0 +1,113 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>SSE Test — 1st Answer Bot</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+    .row { margin: 8px 0; }
+    input, button { font-size: 16px; padding: 8px; }
+    #log { margin-top: 16px; padding: 12px; border: 1px solid #ddd; border-radius: 8px; background:#fafafa; max-width: 800px; }
+    .msg { margin: 6px 0; padding: 6px 8px; border-left: 3px solid #ccc; background:#fff; }
+    .ok { border-color: #0a0; }
+    .warn { border-color: #c80; }
+    .err { border-color: #c00; }
+    code { background:#f3f3f3; padding:2px 4px; border-radius:4px;}
+  </style>
+</head>
+<body>
+  <h1>SSE Test — 1st Answer Bot</h1>
+  <div class="row">
+    <input id="q" placeholder="Type a question (e.g., What are your hours?)" size="50" />
+  </div>
+  <div class="row">
+    <input id="em" placeholder="(Optional) your email for fallback" size="40" />
+  </div>
+  <div class="row">
+    <button id="askBtn">Ask (escalate to human)</button>
+  </div>
+
+  <div id="log"></div>
+
+  <script>
+    const log = (text, cls='') => {
+      const div = document.createElement('div');
+      div.className = 'msg ' + cls;
+      div.textContent = text;
+      document.getElementById('log').prepend(div);
+    };
+
+    // Track pending QIDs awaiting a live SSE answer
+    const pending = {};
+
+    // Open SSE stream (same-origin to avoid CORS)
+    const es = new EventSource('/api/stream');
+    es.addEventListener('open', () => log('SSE connected', 'ok'));
+    es.addEventListener('error', () => log('SSE error (check server running)', 'err'));
+    es.addEventListener('qa:answer', (evt) => {
+      const data = JSON.parse(evt.data); // { qid, question, answer, pdf }
+      log(`Live answer received for QID ${data.qid}: ${data.answer}`, 'ok');
+      if (pending[data.qid]) {
+        pending[data.qid].resolve(data);
+        delete pending[data.qid];
+      }
+    });
+
+    async function escalate(question, userEmail) {
+      log('Escalating to human...', 'warn');
+      const r = await fetch('/api/unknown', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question, userEmail: userEmail || null })
+      });
+      const j = await r.json();
+      if (!j.success) {
+        log('Unknown flow failed', 'err');
+        return;
+      }
+      const { qid, expiresAt } = j;
+      const waitMs = Math.max(0, expiresAt - Date.now());
+      log(`Ticket created [QID: ${qid}]. Waiting up to ${(waitMs/1000)|0}s for live answer...`, 'warn');
+
+      // Promise resolves on SSE or falls back after timeout
+      const result = await new Promise((resolve) => {
+        pending[qid] = { resolve };
+        setTimeout(async () => {
+          if (pending[qid]) {
+            // timeout: attach email if user provided one
+            if (userEmail) {
+              try {
+                await fetch(`/api/pending/${qid}/email`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ userEmail })
+                });
+                log('No live answer in time — will email you when the rep responds.', 'warn');
+              } catch {
+                log('Failed to attach email for fallback.', 'err');
+              }
+            } else {
+              log('No live answer — (optional) provide an email next time to get the answer later.', 'warn');
+            }
+            resolve({ deferred: true, qid });
+            delete pending[qid];
+          }
+        }, waitMs);
+      });
+
+      return result;
+    }
+
+    document.getElementById('askBtn').addEventListener('click', async () => {
+      const q = document.getElementById('q').value.trim();
+      const em = document.getElementById('em').value.trim();
+      if (!q) { log('Please type a question.', 'err'); return; }
+      const res = await escalate(q, em || null);
+      if (res && res.deferred) {
+        log(`Deferred (QID ${res.qid}).`, 'warn');
+      }
+    });
+  </script>
+</body>
+</html>

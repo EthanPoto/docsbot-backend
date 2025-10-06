@@ -1,0 +1,79 @@
+{
+  "0e7d1053c7f1": {
+    "qid": "0e7d1053c7f1",
+    "question": "What are your hours?",
+    "createdAt": 1759256604878,
+    "userEmail": "you@example.com",
+    "answeredAt": null
+  },
+  "332bb8ce025d": {
+    "qid": "332bb8ce025d",
+    "question": "What are your hours?",
+    "createdAt": 1759259543408,
+    "userEmail": "you@example.com",
+    "answeredAt": null
+  },
+  "3fdf491d77a3": {
+    "qid": "3fdf491d77a3",
+    "question": "What are your hours?",
+    "createdAt": 1759261720479,
+    "userEmail": "hello@1stanswerbot.com",
+    "answeredAt": null
+  },
+  "4c0c29c18f9e": {
+    "qid": "4c0c29c18f9e",
+    "question": "What are your hours?",
+    "createdAt": 1759261995545,
+    "userEmail": "you@example.com",
+    "answeredAt": null
+  },
+  "f2e7a7f96419": {
+    "qid": "f2e7a7f96419",
+    "question": "What are your hours?",
+    "createdAt": 1759262335836,
+    "userEmail": "you@example.com",
+    "answeredAt": null
+  },
+  "cd64c5227c44": {
+    "qid": "cd64c5227c44",
+    "question": "What are your hours?",
+    "createdAt": 1759262723158,
+    "userEmail": "you@example.com",
+    "answeredAt": null
+  },
+  "b09cc1001d1b": {
+    "qid": "b09cc1001d1b",
+    "question": "What are your hours?",
+    "createdAt": 1759263346466,
+    "userEmail": "you@example.com",
+    "answeredAt": null
+  },
+  "5b7f1c544852": {
+    "qid": "5b7f1c544852",
+    "question": "What are your hours?",
+    "createdAt": 1759264705184,
+    "userEmail": "you@example.com",
+    "answeredAt": null
+  },
+  "f35a7cf416ed": {
+    "qid": "f35a7cf416ed",
+    "question": "What are your hours?",
+    "createdAt": 1759265045142,
+    "userEmail": "you@example.com",
+    "answeredAt": 1759266978266
+  },
+  "f874c2345537": {
+    "qid": "f874c2345537",
+    "question": "Do you offer weekend support?",
+    "createdAt": 1759267543659,
+    "userEmail": "you@example.com",
+    "answeredAt": 1759267589183
+  },
+  "d94eee911432": {
+    "qid": "d94eee911432",
+    "question": "Do you offer weekend support?",
+    "createdAt": 1759268095243,
+    "userEmail": "ejpoto10@gmail.com",
+    "answeredAt": 1759268128918
+  }
+}

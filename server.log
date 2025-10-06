@@ -1,0 +1,45 @@
+
+> docsbot-backend@1.0.0 start
+> node server.js
+
+BOOT { cwd: '/Users/ethan.poto/Desktop/docsbot-backend', node: 'v22.20.0' }
+Server listening on http://localhost:3000
+Check: /api/status  /public/qa-today.pdf  /api/stream
+POST /api/unknown
+Sent unknown-question email to rep { to: 'hello@1stanswerbot.com', qid: 'f35a7cf416ed' }
+POST /inbound?secret=test123
+Inbound email: {
+  from: 'Ethan Poto <hello@1stanswerbot.com>',
+  to: 'qa@replies.1stanswerbot.com',
+  subject: 'Re: New unanswered question [QID:f35a7cf416ed]'
+}
+Emailed user answer (outside 2min) { qid: 'f35a7cf416ed', to: 'you@example.com' }
+Inbound handled { qid: 'f35a7cf416ed', delivery: 'email_user' }
+POST /api/unknown
+Sent unknown-question email to rep { to: 'hello@1stanswerbot.com', qid: 'f874c2345537' }
+POST /inbound?secret=test123
+Inbound email: {
+  from: 'Ethan Poto <hello@1stanswerbot.com>',
+  to: 'qa@replies.1stanswerbot.com',
+  subject: 'Re: New unanswered question [QID:f874c2345537]'
+}
+Pushed realtime answer to chat { qid: 'f874c2345537' }
+Inbound handled { qid: 'f874c2345537', delivery: 'chat' }
+GET /public/sse-test.html
+GET /api/stream
+POST /api/unknown
+Sent unknown-question email to rep { to: 'hello@1stanswerbot.com', qid: 'd94eee911432' }
+POST /inbound?secret=test123
+Inbound email: {
+  from: 'Ethan Poto <hello@1stanswerbot.com>',
+  to: 'qa@replies.1stanswerbot.com',
+  subject: 'Re: New unanswered question [QID:d94eee911432]'
+}
+Pushed realtime answer to chat { qid: 'd94eee911432' }
+Inbound handled { qid: 'd94eee911432', delivery: 'chat' }
+GET /api/stream
+GET /api/stream
+GET /api/stream
+Archived PDF {
+  dst: '/Users/ethan.poto/Desktop/docsbot-backend/data/archive/qa-2025-09-30.pdf'
+}

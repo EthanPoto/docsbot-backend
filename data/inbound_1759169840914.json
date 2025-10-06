@@ -1,0 +1,6 @@
+{
+  "from": "Ethan <ethan@example.com>",
+  "to": "test@replies.1stanswerbot.com",
+  "subject": "Test Email",
+  "text": "Hello world"
+}
