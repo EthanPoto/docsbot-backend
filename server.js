@@ -31,6 +31,7 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 
 const app = express();
+app.get('/healthz', (_req, res) => res.status(200).type('text').send('ok'));
 
 // CORS (allow your sites)
 app.use(cors({
