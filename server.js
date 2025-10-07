@@ -19,8 +19,11 @@ const BASE_URL =
   process.env.BASE_URL ||
   process.env.RENDER_EXTERNAL_URL ||
   `http://localhost:${PORT}`;
+
 const INBOUND_SECRET = process.env.INBOUND_SECRET || ''; // header x-inbound-secret OR ?secret=...
+const ADMIN_SECRET = process.env.ADMIN_SECRET || '';     // for admin-only endpoints
 const DEBUG_INBOUND_ENV = /^(1|true|yes)$/i.test(String(process.env.DEBUG_INBOUND || ''));
+const ARCHIVE_RETENTION_DAYS = parseInt(process.env.ARCHIVE_RETENTION_DAYS || '60', 10);
 
 // best-effort build id for /health
 const BUILD = process.env.RENDER_GIT_COMMIT || process.env.BUILD || 'dev';
@@ -35,6 +38,19 @@ const app = express();
 app.use(cors({ origin: true, credentials: false }));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+
+// Serve /public with no-cache for PDFs so the latest always shows
+app.use('/public', express.static(PUBLIC_DIR, {
+  etag: false,
+  lastModified: true,
+  setHeaders: (res, filePath) => {
+    if (filePath.toLowerCase().endsWith('.pdf')) {
+      res.setHeader('Cache-Control', 'no-store, max-age=0');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+    }
+  }
+}));
 
 // uploads for inbound
 const upload = multer({ limits: { fieldSize: 1 * 1024 * 1024 } });
@@ -196,9 +212,7 @@ function parseQAOrAnswerOnly(raw = '') {
 const isPendingItem = (it) => it && ((!it.a || !String(it.a).trim()) || it.status === 'pending');
 const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
 
-// ------------ STATIC & BASIC ROUTES ------------
-app.use('/public', express.static(PUBLIC_DIR));
-
+// ------------ BASIC ROUTES ------------
 app.get('/health', (_req, res) => {
   res.json({ ok: true, time: new Date().toISOString(), build: BUILD, debugInbound: DEBUG_INBOUND_ENV });
 });
@@ -232,6 +246,76 @@ app.get('/c/:slug/api/peek', (req, res) => {
   const store = loadStore(storePath);
   const items = store.items.slice(-limit);
   res.json({ slug: raw, count: store.items.length, last: items });
+});
+
+// ---------- ARCHIVES: LIST + DOWNLOAD + MANUAL ROLLOVER ----------
+function listArchiveFiles(archiveDir) {
+  try {
+    const files = fs.readdirSync(archiveDir)
+      .filter(f => /^qa-\d{4}-\d{2}-\d{2}\.pdf$/i.test(f))
+      .sort() // ascending by name (date)
+      .reverse(); // most recent first
+    return files;
+  } catch {
+    return [];
+  }
+}
+
+// List archives with direct URLs
+app.get('/c/:slug/api/archives', (req, res) => {
+  const raw = (req.params.slug || '').toLowerCase();
+  const { archive, slug } = slugDirs(raw);
+  const files = listArchiveFiles(archive);
+  const items = files.map(name => ({
+    name,
+    url: `${BASE_URL}/c/${encodeURIComponent(slug)}/archive/${encodeURIComponent(name)}`
+  }));
+  res.json({ slug, count: items.length, items });
+});
+
+// Serve a specific archived PDF securely
+app.get('/c/:slug/archive/:file', (req, res) => {
+  const raw = (req.params.slug || '').toLowerCase();
+  const file = String(req.params.file || '');
+  if (!/^qa-\d{4}-\d{2}-\d{2}\.pdf$/i.test(file)) {
+    return res.status(400).send('bad filename');
+  }
+  const { archive } = slugDirs(raw);
+  const full = path.join(archive, file);
+  if (!fs.existsSync(full)) return res.status(404).send('not found');
+  res.setHeader('Cache-Control', 'no-store, max-age=0');
+  return res.sendFile(full);
+});
+
+// Manual rollover (archive now + reset). Secured by ADMIN_SECRET or INBOUND_SECRET.
+app.post('/c/:slug/api/archive-now', (req, res) => {
+  const raw = (req.params.slug || '').toLowerCase();
+  const { archive, storePath, todayPdf, slug } = slugDirs(raw);
+
+  const sec = (req.query.secret || req.headers['x-admin-secret'] || req.headers['x-inbound-secret'] || '').toString();
+  const okSecret = (ADMIN_SECRET && sec === ADMIN_SECRET) || (INBOUND_SECRET && sec === INBOUND_SECRET);
+  if (!okSecret) return res.status(403).send('forbidden');
+
+  const now = DateTime.now().setZone(TIMEZONE);
+  const day = now.toFormat('yyyy-LL-dd');
+
+  // Ensure today's PDF reflects current store
+  const store = loadStore(storePath);
+  writeTodayPdf(todayPdf, slug, store.items || []);
+
+  // Copy to archive
+  const out = path.join(archive, `qa-${day}.pdf`);
+  try {
+    fs.copyFileSync(todayPdf, out);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: 'copy_failed', detail: String(e) });
+  }
+
+  // Reset today
+  saveStore(storePath, { items: [] });
+  writeTodayPdf(todayPdf, slug, []);
+
+  return res.json({ ok: true, slug, archived: path.basename(out) });
 });
 
 // ------------ INBOUND (SendGrid Inbound Parse) ------------
@@ -366,18 +450,44 @@ cron.schedule('5 0 * * *', () => {
   try {
     const zone = TIMEZONE;
     const day = DateTime.now().setZone(zone).toFormat('yyyy-LL-dd');
+    const cutoff = DateTime.now().minus({ days: ARCHIVE_RETENTION_DAYS });
+
     const slugs = listSlugs();
     slugs.forEach(slug => {
       const { storePath, archive, todayPdf } = slugDirs(slug);
+      // ensure today's pdf exists before copying
+      const store = loadStore(storePath);
+      if (!fs.existsSync(todayPdf)) writeTodayPdf(todayPdf, slug, store.items || []);
+
       // copy today PDF to archive
       if (fs.existsSync(todayPdf)) {
         const out = path.join(archive, `qa-${day}.pdf`);
-        fs.copyFileSync(todayPdf, out);
-        console.log('Archived PDF', { slug, out });
+        try {
+          fs.copyFileSync(todayPdf, out);
+          console.log('Archived PDF', { slug, out });
+        } catch (e) {
+          console.error('Archive copy failed', { slug, e: String(e) });
+        }
       }
+
       // reset today's store and PDF
       saveStore(storePath, { items: [] });
       writeTodayPdf(todayPdf, slug, []);
+
+      // purge old archives (optional)
+      try {
+        const files = fs.readdirSync(archive);
+        files.forEach(f => {
+          if (!/^qa-\d{4}-\d{2}-\d{2}\.pdf$/i.test(f)) return;
+          const d = f.slice(3, 13); // yyyy-mm-dd
+          const dt = DateTime.fromFormat(d, 'yyyy-LL-dd');
+          if (dt.isValid && dt < cutoff) {
+            fs.unlinkSync(path.join(archive, f));
+          }
+        });
+      } catch (e) {
+        console.error('Archive purge failed', { slug, e: String(e) });
+      }
     });
   } catch (e) {
     console.error('Archive job failed', e);
@@ -397,7 +507,7 @@ cron.schedule('5 0 * * *', () => {
 // ------------ START ------------
 app.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
-  console.log(`Health: /health  Status: /api/status  Company status: /c/:slug/api/status  Peek: /c/:slug/api/peek  PDFs under /public/:slug/qa-today.pdf`);
+  console.log(`Health: /health  Status: /api/status  Company status: /c/:slug/api/status  Peek: /c/:slug/api/peek  Archives: /c/:slug/api/archives  Download: /c/:slug/archive/:file  PDFs under /public/:slug/qa-today.pdf`);
 });
 
 // Graceful-ish error logs
