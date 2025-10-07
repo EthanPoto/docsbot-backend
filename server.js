@@ -17,9 +17,13 @@ const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');      
 const PUBLIC_DIR = process.env.PUBLIC_DIR || path.join(process.cwd(), 'public');  // static pdfs
 const BASE_URL =
   process.env.BASE_URL ||
-  process.env.RENDER_EXTERNAL_URL || // Render sets this
+  process.env.RENDER_EXTERNAL_URL ||
   `http://localhost:${PORT}`;
 const INBOUND_SECRET = process.env.INBOUND_SECRET || ''; // header x-inbound-secret OR ?secret=...
+const DEBUG_INBOUND = /^(1|true|yes)$/i.test(String(process.env.DEBUG_INBOUND || ''));
+
+// best-effort build id for /health
+const BUILD = process.env.RENDER_GIT_COMMIT || process.env.BUILD || 'dev';
 
 // ensure root dirs
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -89,26 +93,7 @@ function writeTodayPdf(pdfPath, slug, items) {
   });
 }
 
-// Accepts either "Q: ...\nA: ..." or just "Q: ..." (A optional)
-function parseQARelaxed(text = '') {
-  const s = String(text || '');
-  // Find first Q: and optional A: later in the string (case-insensitive)
-  const m = s.match(/Q:\s*([\s\S]*?)(?:\nA:\s*([\s\S]*))?$/i);
-  if (!m) return null;
-
-  const q = (m[1] || '').trim();
-  let a = (m[2] || '').trim();
-
-  // If we captured an A:, cut it off at common quoted-reply markers / next Q:
-  if (a) {
-    const cutAt = a.search(/^\s*(Q:|On .* wrote:|From:|Sent:|-----|>)/im);
-    if (cutAt > -1) a = a.slice(0, cutAt).trim();
-  }
-
-  if (!q) return null;
-  return { q, a, hasA: Boolean(a) };
-}
-
+// Robust text extraction from HTML (if only HTML is provided)
 function htmlToText(html) {
   if (!html) return '';
   return String(html)
@@ -160,24 +145,48 @@ function deriveSlugFromAddress(toAddrRaw = '') {
   return 'default';
 }
 
-// ------------ STATIC & BASIC ROUTES ------------
-// Add no-store for the "today" PDF to avoid stale cache
-app.use('/public', express.static(PUBLIC_DIR, {
-  etag: false,
-  lastModified: true,
-  maxAge: 0,
-  setHeaders: (res, filePath) => {
-    if (filePath.endsWith('qa-today.pdf')) {
-      res.setHeader('Cache-Control', 'no-store');
-    }
-  }
-}));
+/**
+ * Parse inbound body to detect:
+ *   - QA: both Q and A present
+ *   - Q:  Q present, A missing
+ *   - A:  A present, Q missing  (used to fill the most recent pending Q)
+ *
+ * Returns { mode: 'QA'|'Q'|'A', q?: string, a?: string }
+ */
+function parseQAOrAnswerOnly(raw = '') {
+  const t = String(raw || '');
 
-app.get('/health', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+  // Grab first Q: line (if any)
+  const qMatch = t.match(/^\s*Q:\s*(.+)$/im);
+  // Grab first A: block (if any) — everything until a common quote marker or another Q:
+  let aMatch = t.match(/^\s*A:\s*([\s\S]+)$/im);
+  let aText = '';
+  if (aMatch) {
+    aText = aMatch[1];
+    const cutAt = aText.search(/^\s*(Q:|On .* wrote:|From:|Sent:|-----|>)/im);
+    if (cutAt > -1) aText = aText.slice(0, cutAt);
+    aText = aText.trim();
+  }
+
+  const q = qMatch ? qMatch[1].trim() : '';
+  const a = aText;
+
+  if (q && a) return { mode: 'QA', q, a };
+  if (q && !a) return { mode: 'Q', q };
+  if (!q && a) return { mode: 'A', a };
+  return { mode: 'NONE' };
+}
+
+// ------------ STATIC & BASIC ROUTES ------------
+app.use('/public', express.static(PUBLIC_DIR));
+
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, time: new Date().toISOString(), build: BUILD, debugInbound: DEBUG_INBOUND });
+});
 
 // Fallback health for Render (some templates check /api/status)
 app.get('/api/status', (_req, res) => {
-  res.json({ ok: true, note: 'prefer /health', time: new Date().toISOString() });
+  res.json({ ok: true, note: 'prefer /health', time: new Date().toISOString(), build: BUILD });
 });
 
 app.get('/', (_req, res) => {
@@ -196,6 +205,16 @@ app.get('/c/:slug/api/status', (req, res) => {
   res.json({ slug, count: store.items.length, todayPdfUrl });
 });
 
+// Quick peek of last N items (debugging)
+app.get('/c/:slug/api/peek', (req, res) => {
+  const raw = (req.params.slug || '').toLowerCase();
+  const limit = Math.max(1, Math.min(50, parseInt(req.query.limit || '5', 10)));
+  const { storePath } = slugDirs(raw);
+  const store = loadStore(storePath);
+  const items = store.items.slice(-limit);
+  res.json({ slug: raw, count: store.items.length, last: items });
+});
+
 // ------------ INBOUND (SendGrid Inbound Parse) ------------
 app.post('/inbound', upload.any(), (req, res) => {
   try {
@@ -204,7 +223,7 @@ app.post('/inbound', upload.any(), (req, res) => {
       const h = (req.headers['x-inbound-secret'] || '').toString();
       const q = (req.query.secret || '').toString();
       if (h !== INBOUND_SECRET && q !== INBOUND_SECRET) {
-        console.warn('Inbound forbidden: bad secret', { hasHeader: Boolean(h), hasQuery: Boolean(q) });
+        if (DEBUG_INBOUND) console.warn('Inbound forbidden: bad secret', { hasHeader: Boolean(h), hasQuery: Boolean(q) });
         return res.status(403).send('forbidden');
       }
     }
@@ -215,7 +234,6 @@ app.post('/inbound', upload.any(), (req, res) => {
     let toAddr = '';
     try {
       const env = JSON.parse(fields.envelope || '{}');
-      // Some providers send "to" as array
       toAddr = (Array.isArray(env.to) ? env.to[0] : env.to) || fields.to || '';
     } catch {
       toAddr = fields.to || '';
@@ -224,48 +242,92 @@ app.post('/inbound', upload.any(), (req, res) => {
     const derivedSlug = deriveSlugFromAddress(toAddr);
 
     // Prefer plain text; otherwise convert HTML to text
-    const bodyText = (fields.text && fields.text.trim())
-      ? fields.text
-      : htmlToText(fields.html || '');
+    const bodyText =
+      (fields.text && fields.text.trim())
+        ? fields.text
+        : htmlToText(fields.html || '');
 
-    const qa = parseQARelaxed(bodyText);
-    if (!qa) {
-      console.warn('Inbound parse failed (no Q:/A:)', { derivedSlug, toAddr });
-      // Always 200 to keep SendGrid happy
+    const parsed = parseQAOrAnswerOnly(bodyText);
+    if (DEBUG_INBOUND) console.log('INBOUND PARSED', { slug: derivedSlug, mode: parsed.mode, hasQ: !!parsed.q, hasA: !!parsed.a });
+
+    if (parsed.mode === 'NONE') {
+      if (DEBUG_INBOUND) console.warn('Inbound parse failed (no Q:/A:)', { derivedSlug, toAddr, sample: bodyText.slice(0, 200) });
       return res.status(200).json({ ok: false, error: 'No Q:/A: found' });
     }
 
-    // Save to per-company store and regenerate PDF
     const { storePath, todayPdf, slug } = slugDirs(derivedSlug);
     const store = loadStore(storePath);
-    store.items.push({
-      q: qa.q,
-      a: qa.hasA ? qa.a : '',
-      status: qa.hasA ? 'answered' : 'pending',
-      ts: Date.now(),
-      source: 'email'
-    });
+
+    let resultMode = parsed.mode;
+
+    if (parsed.mode === 'QA') {
+      store.items.push({
+        q: parsed.q,
+        a: parsed.a,
+        status: 'answered',
+        ts: Date.now(),
+        source: 'email'
+      });
+    } else if (parsed.mode === 'Q') {
+      store.items.push({
+        q: parsed.q,
+        a: '',
+        status: 'pending',
+        ts: Date.now(),
+        source: 'email'
+      });
+    } else if (parsed.mode === 'A') {
+      // Fill most recent pending item
+      let updated = false;
+      for (let i = store.items.length - 1; i >= 0; i--) {
+        const it = store.items[i];
+        if (!it) continue;
+        const isPending = (!it.a || !String(it.a).trim()) || it.status === 'pending';
+        if (isPending) {
+          it.a = parsed.a;
+          it.status = 'answered';
+          it.answeredTs = Date.now();
+          updated = true;
+          resultMode = 'A->updated_last_pending';
+          break;
+        }
+      }
+      if (!updated) {
+        // No pending found — store as standalone entry to avoid losing the answer
+        store.items.push({
+          q: '(unspecified question)',
+          a: parsed.a,
+          status: 'answered',
+          ts: Date.now(),
+          source: 'email'
+        });
+        resultMode = 'A->no_pending_created_new';
+      }
+    }
+
     saveStore(storePath, store);
     writeTodayPdf(todayPdf, slug, store.items);
 
     // (Optional) persist raw inbound for debugging
-    try {
-      const dbg = {
-        to: toAddr,
-        subject: fields.subject || '',
-        receivedAt: new Date().toISOString(),
-        parsed: { q: qa.q, a: qa.a || '', hasA: qa.hasA }
-      };
-      fs.writeFileSync(
-        path.join(DATA_DIR, slug, `inbound_${Date.now()}.json`),
-        JSON.stringify(dbg, null, 2)
-      );
-    } catch {}
+    if (DEBUG_INBOUND) {
+      try {
+        const dbg = {
+          to: toAddr,
+          subject: fields.subject || '',
+          receivedAt: new Date().toISOString(),
+          parsed
+        };
+        fs.writeFileSync(
+          path.join(DATA_DIR, slug, `inbound_${Date.now()}.json`),
+          JSON.stringify(dbg, null, 2)
+        );
+      } catch {}
+    }
 
-    return res.status(200).json({ ok: true, slug, added: 1, pending: !qa.hasA });
+    const pending = store.items.some(it => (!it.a || !String(it.a).trim()));
+    return res.status(200).json({ ok: true, slug, added: 1, pending, mode: resultMode });
   } catch (err) {
     console.error('Inbound error:', err);
-    // Return 200 so SendGrid doesn’t retry endlessly
     return res.status(200).json({ ok: false, error: 'inbound exception' });
   }
 });
@@ -306,7 +368,7 @@ cron.schedule('5 0 * * *', () => {
 // ------------ START ------------
 app.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
-  console.log(`Health: /health  Status: /api/status  Company status: /c/:slug/api/status  PDFs under /public/:slug/qa-today.pdf`);
+  console.log(`Health: /health  Status: /api/status  Company status: /c/:slug/api/status  Peek: /c/:slug/api/peek  PDFs under /public/:slug/qa-today.pdf`);
 });
 
 // Graceful-ish error logs
