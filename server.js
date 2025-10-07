@@ -31,6 +31,9 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 
 const app = express();
+
+// Health checks for Render
+app.get('/health',  (_req, res) => res.status(200).type('text').send('ok'));
 app.get('/healthz', (_req, res) => res.status(200).type('text').send('ok'));
 
 // CORS (allow your sites)
@@ -292,7 +295,8 @@ app.use(express.static(PUBLIC_DIR));
 app.get('/', (_req, res) => {
   res.type('html').send(`<h1>Backend OK</h1>
   <ul>
-    <li><a href="/api/status">/api/status</a> (add ?slug=FirstAnswerBot or ?slug=server-partners)</li>
+    <li><a href="/health">/health</a></li>
+    <li><a href="/api/status">/api/status</a> (add ?slug=FirstAnswerBot or ?slug=ServerPartners)</li>
   </ul>`);
 });
 
@@ -371,7 +375,6 @@ app.post('/api/unknown', requireApiKey, async (req, res) => {
   if (!question) return res.status(400).json({ error: 'Missing question' });
   try {
     await handleUnknownQuestion(question);
-    // Broadcast a pending ticket (optional)
     const qid = crypto.randomBytes(6).toString('hex');
     const expiresAt = Date.now() + 2 * 60 * 1000;
     res.json({ success: true, qid, expiresAt, waitMs: expiresAt - Date.now(), message: "Question sent to a human." });
@@ -383,7 +386,6 @@ app.post('/api/unknown', requireApiKey, async (req, res) => {
 // --- Admin (hash delete) ----------------------------------------------------
 app.get('/api/entries', (req, res) => {
   if (!ADMIN_TOKEN || req.headers.authorization !== `Bearer ${ADMIN_TOKEN}`) return res.sendStatus(401);
-  // default tenant listing
   const out = [];
   for (const slug of listSlugs()) {
     const P = pathsFor(slug);
@@ -410,7 +412,6 @@ app.post('/api/delete', express.json(), (req, res) => {
 });
 
 function listSlugs() {
-  // list subdirectories in DATA_DIR; if none, include 'default' for legacy
   try {
     const items = fs.readdirSync(DATA_DIR, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => d.name);
     return items.length ? items : ['default'];
@@ -445,12 +446,11 @@ cron.schedule('59 23 * * *', () => {
 if (!fs.existsSync(TODAY_PDF)) {
   const P = pathsFor('default');
   regeneratePdfFromStore(P.store, P.todayPdf, P.company);
-  // also symlink/copy to legacy path for compatibility
   try { fs.copyFileSync(P.todayPdf, TODAY_PDF); } catch {}
 }
 
 // start
 app.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
-  console.log(`Try per-tenant status: /api/status?slug=FirstAnswerBot  or  /api/status?slug=server-partners`);
+  console.log(`Try per-tenant status: /api/status?slug=FirstAnswerBot  or  /api/status?slug=ServerPartners`);
 });
