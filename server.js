@@ -20,7 +20,7 @@ const BASE_URL =
   process.env.RENDER_EXTERNAL_URL ||
   `http://localhost:${PORT}`;
 const INBOUND_SECRET = process.env.INBOUND_SECRET || ''; // header x-inbound-secret OR ?secret=...
-const DEBUG_INBOUND = /^(1|true|yes)$/i.test(String(process.env.DEBUG_INBOUND || ''));
+const DEBUG_INBOUND_ENV = /^(1|true|yes)$/i.test(String(process.env.DEBUG_INBOUND || ''));
 
 // best-effort build id for /health
 const BUILD = process.env.RENDER_GIT_COMMIT || process.env.BUILD || 'dev';
@@ -114,6 +114,22 @@ function listSlugs() {
 }
 
 /**
+ * Prefer the replies.* address from envelope/headers when multiple recipients exist.
+ */
+function pickInboundAddress(fields = {}) {
+  let rcpts = [];
+  try {
+    const env = JSON.parse(fields.envelope || '{}');
+    rcpts = Array.isArray(env.to) ? env.to : (env.to ? [env.to] : []);
+  } catch {}
+  if (!rcpts.length && fields.to) {
+    rcpts = String(fields.to).split(',').map(s => s.trim());
+  }
+  const picked = rcpts.find(x => /\.replies\./i.test(x)) || rcpts[0] || '';
+  return picked;
+}
+
+/**
  * Derive a tenant slug from a "to" address.
  * Supports:
  *   1) Plus addressing: qa+<slug>@replies.yourdomain.com
@@ -151,7 +167,7 @@ function deriveSlugFromAddress(toAddrRaw = '') {
  *   - Q:  Q present, A missing
  *   - A:  A present, Q missing  (used to fill the most recent pending Q)
  *
- * Returns { mode: 'QA'|'Q'|'A', q?: string, a?: string }
+ * Returns { mode: 'QA'|'Q'|'A'|'NONE', q?: string, a?: string }
  */
 function parseQAOrAnswerOnly(raw = '') {
   const t = String(raw || '');
@@ -177,11 +193,14 @@ function parseQAOrAnswerOnly(raw = '') {
   return { mode: 'NONE' };
 }
 
+const isPendingItem = (it) => it && ((!it.a || !String(it.a).trim()) || it.status === 'pending');
+const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+
 // ------------ STATIC & BASIC ROUTES ------------
 app.use('/public', express.static(PUBLIC_DIR));
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, time: new Date().toISOString(), build: BUILD, debugInbound: DEBUG_INBOUND });
+  res.json({ ok: true, time: new Date().toISOString(), build: BUILD, debugInbound: DEBUG_INBOUND_ENV });
 });
 
 // Fallback health for Render (some templates check /api/status)
@@ -218,6 +237,8 @@ app.get('/c/:slug/api/peek', (req, res) => {
 // ------------ INBOUND (SendGrid Inbound Parse) ------------
 app.post('/inbound', upload.any(), (req, res) => {
   try {
+    const DEBUG_INBOUND = DEBUG_INBOUND_ENV || /^(1|true|yes)$/i.test(String(req.query.debug || ''));
+
     // Shared secret — accept header OR query (SendGrid can't add custom headers)
     if (INBOUND_SECRET) {
       const h = (req.headers['x-inbound-secret'] || '').toString();
@@ -230,15 +251,8 @@ app.post('/inbound', upload.any(), (req, res) => {
 
     const fields = Object.fromEntries(Object.entries(req.body || {}));
 
-    // Derive "to" from envelope JSON (preferred) or fallback to raw "to"
-    let toAddr = '';
-    try {
-      const env = JSON.parse(fields.envelope || '{}');
-      toAddr = (Array.isArray(env.to) ? env.to[0] : env.to) || fields.to || '';
-    } catch {
-      toAddr = fields.to || '';
-    }
-
+    // Prefer replies.* recipient to derive slug
+    const toAddr = pickInboundAddress(fields);
     const derivedSlug = deriveSlugFromAddress(toAddr);
 
     // Prefer plain text; otherwise convert HTML to text
@@ -261,13 +275,29 @@ app.post('/inbound', upload.any(), (req, res) => {
     let resultMode = parsed.mode;
 
     if (parsed.mode === 'QA') {
-      store.items.push({
-        q: parsed.q,
-        a: parsed.a,
-        status: 'answered',
-        ts: Date.now(),
-        source: 'email'
-      });
+      // Try to close a matching pending by question; else add answered
+      let matched = false;
+      for (let i = store.items.length - 1; i >= 0; i--) {
+        const it = store.items[i];
+        if (isPendingItem(it) && norm(it.q) === norm(parsed.q)) {
+          it.a = parsed.a;
+          it.status = 'answered';
+          it.answeredTs = Date.now();
+          matched = true;
+          resultMode = 'QA->matched_pending';
+          break;
+        }
+      }
+      if (!matched) {
+        store.items.push({
+          q: parsed.q,
+          a: parsed.a,
+          status: 'answered',
+          ts: Date.now(),
+          source: 'email'
+        });
+        resultMode = 'QA->created_new';
+      }
     } else if (parsed.mode === 'Q') {
       store.items.push({
         q: parsed.q,
@@ -282,8 +312,7 @@ app.post('/inbound', upload.any(), (req, res) => {
       for (let i = store.items.length - 1; i >= 0; i--) {
         const it = store.items[i];
         if (!it) continue;
-        const isPending = (!it.a || !String(it.a).trim()) || it.status === 'pending';
-        if (isPending) {
+        if (isPendingItem(it)) {
           it.a = parsed.a;
           it.status = 'answered';
           it.answeredTs = Date.now();
@@ -324,8 +353,8 @@ app.post('/inbound', upload.any(), (req, res) => {
       } catch {}
     }
 
-    const pending = store.items.some(it => (!it.a || !String(it.a).trim()));
-    return res.status(200).json({ ok: true, slug, added: 1, pending, mode: resultMode });
+    const anyPending = store.items.some(it => (!it.a || !String(it.a).trim()));
+    return res.status(200).json({ ok: true, slug, mode: resultMode, pending: anyPending, added: 1 });
   } catch (err) {
     console.error('Inbound error:', err);
     return res.status(200).json({ ok: false, error: 'inbound exception' });
