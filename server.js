@@ -261,9 +261,11 @@ app.post('/inbound', upload.any(), (req, res) => {
     const parsed = parseQAFromText(textBody);
 
     if (!parsed.length) {
-      console.warn('Inbound parse failed (no Q:/A:). subject=', payload.subject);
-      return res.status(400).json({ ok: false, error: 'Bad format. Use "Q: ...\\nA: ..."' });
-    }
+  console.log('Inbound ignored (no Q:/A:). subject=', payload.subject);
+  // 200 so SendGrid doesn’t retry normal non-answer messages
+  return res.status(200).json({ ok: true, ignored: true, reason: 'no Q/A lines found' });
+}
+
 
     let store = loadStore(P.store);
     let added = 0, skipped = 0;
