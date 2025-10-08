@@ -261,11 +261,10 @@ app.post('/inbound', upload.any(), (req, res) => {
     const parsed = parseQAFromText(textBody);
 
     if (!parsed.length) {
-  console.log('Inbound ignored (no Q:/A:). subject=', payload.subject);
-  // 200 so SendGrid doesn’t retry normal non-answer messages
-  return res.status(200).json({ ok: true, ignored: true, reason: 'no Q/A lines found' });
-}
-
+      console.log('Inbound ignored (no Q:/A:). subject=', payload.subject);
+      // 200 so SendGrid doesn’t retry normal non-answer messages
+      return res.status(200).json({ ok: true, ignored: true, reason: 'no Q/A lines found' });
+    }
 
     let store = loadStore(P.store);
     let added = 0, skipped = 0;
@@ -282,6 +281,26 @@ app.post('/inbound', upload.any(), (req, res) => {
     } else {
       console.log(`Inbound duplicate for [${slug}] (no changes)`);
     }
+
+    // >>> NEW: broadcast live answer if subject has [QID:...] <<<
+    try {
+      const subj = String((payload.subject || '')).trim();
+      const m = subj.match(/\[QID:([a-z0-9-]{6,})\]/i);
+      if (m && parsed.length) {
+        const qid = m[1];
+        const live = parsed[0]; // first Q/A pair
+        broadcast('answer:live', {
+          qid,
+          slug,
+          question: live.q,
+          answer: live.a,
+          pdf: P.todayHref
+        });
+      }
+    } catch (e) {
+      console.warn('QID broadcast skipped:', e.message);
+    }
+    // <<< END NEW >>>
 
     res.status(200).json({ ok: true, slug, parsed: added, skipped, entries: Object.keys(store).length, pdf: P.todayHref });
   } catch (err) {
