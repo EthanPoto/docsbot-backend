@@ -58,17 +58,24 @@ const upload = multer({ limits: { fieldSize: 1 * 1024 * 1024 } });
 // ------------ HELPERS ------------
 function slugDirs(slug) {
   const safe = String(slug || 'default').toLowerCase().replace(/[^a-z0-9-_]/g, '');
+
+  // DATA side
   const base = path.join(DATA_DIR, safe);
   const archive = path.join(base, 'archive');
+
+  // PUBLIC side
   const publicSlug = path.join(PUBLIC_DIR, safe);
+  const publicArchive = path.join(publicSlug, 'archive'); // NEW
+
   const storePath = path.join(base, 'qa_store.json');
   const todayPdf = path.join(publicSlug, 'qa-today.pdf');
 
-  if (!fs.existsSync(base)) fs.mkdirSync(base, { recursive: true });
-  if (!fs.existsSync(archive)) fs.mkdirSync(archive, { recursive: true });
-  if (!fs.existsSync(publicSlug)) fs.mkdirSync(publicSlug, { recursive: true });
+  // ensure dirs
+  [base, archive, publicSlug, publicArchive].forEach(p => {
+    if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+  });
 
-  return { base, archive, publicSlug, storePath, todayPdf, slug: safe };
+  return { base, archive, publicSlug, publicArchive, storePath, todayPdf, slug: safe };
 }
 
 function loadStore(p) {
@@ -78,6 +85,12 @@ function saveStore(p, json) {
   fs.writeFileSync(p, JSON.stringify(json, null, 2));
 }
 
+// Human-readable company name from slug (title-case-ish)
+function displayNameFromSlug(slug = '') {
+  const cleaned = String(slug).replace(/[-_]+/g, ' ').trim();
+  return cleaned.replace(/\b\w/g, c => c.toUpperCase());
+}
+
 function writeTodayPdf(pdfPath, slug, items) {
   const doc = new PDFDocument({ size: 'LETTER', margin: 40 });
   const tmp = pdfPath + '.tmp';
@@ -85,7 +98,8 @@ function writeTodayPdf(pdfPath, slug, items) {
   doc.pipe(stream);
 
   const ts = DateTime.now().setZone(TIMEZONE).toFormat('yyyy-LL-dd HH:mm');
-  doc.fontSize(18).text(`Q/A — ${slug} (Today)`, { underline: true });
+  const company = displayNameFromSlug(slug);
+  doc.fontSize(18).text(`Q/A — ${company} (Today)`, { underline: true });
   doc.moveDown(0.25);
   doc.fontSize(10).text(`Generated: ${ts} ${TIMEZONE}`);
   doc.moveDown();
@@ -252,8 +266,8 @@ app.get('/c/:slug/api/peek', (req, res) => {
 function listArchiveFiles(archiveDir) {
   try {
     const files = fs.readdirSync(archiveDir)
-      .filter(f => /^qa-\d{4}-\d{2}-\d{2}\.pdf$/i.test(f))
-      .sort() // ascending by name (date)
+      .filter(f => /^\d{4}-\d{2}-\d{2}-[a-z0-9-_]+\.pdf$/i.test(f)) // NEW pattern
+      .sort() // ascending by name (date-first)
       .reverse(); // most recent first
     return files;
   } catch {
@@ -261,27 +275,28 @@ function listArchiveFiles(archiveDir) {
   }
 }
 
-// List archives with direct URLs
+// List archives with direct URLs (now points to PUBLIC archive)
 app.get('/c/:slug/api/archives', (req, res) => {
   const raw = (req.params.slug || '').toLowerCase();
-  const { archive, slug } = slugDirs(raw);
-  const files = listArchiveFiles(archive);
+  const { publicArchive, slug } = slugDirs(raw);
+  const files = listArchiveFiles(publicArchive);
+  const baseUrl = `${BASE_URL}/public/${encodeURIComponent(slug)}/archive`;
   const items = files.map(name => ({
     name,
-    url: `${BASE_URL}/c/${encodeURIComponent(slug)}/archive/${encodeURIComponent(name)}`
+    url: `${baseUrl}/${encodeURIComponent(name)}`
   }));
   res.json({ slug, count: items.length, items });
 });
 
-// Serve a specific archived PDF securely
+// Serve a specific archived PDF (now from PUBLIC archive, supports new filename)
 app.get('/c/:slug/archive/:file', (req, res) => {
   const raw = (req.params.slug || '').toLowerCase();
   const file = String(req.params.file || '');
-  if (!/^qa-\d{4}-\d{2}-\d{2}\.pdf$/i.test(file)) {
+  if (!/^\d{4}-\d{2}-\d{2}-[a-z0-9-_]+\.pdf$/i.test(file)) {
     return res.status(400).send('bad filename');
   }
-  const { archive } = slugDirs(raw);
-  const full = path.join(archive, file);
+  const { publicArchive } = slugDirs(raw);
+  const full = path.join(publicArchive, file);
   if (!fs.existsSync(full)) return res.status(404).send('not found');
   res.setHeader('Cache-Control', 'no-store, max-age=0');
   return res.sendFile(full);
@@ -290,7 +305,7 @@ app.get('/c/:slug/archive/:file', (req, res) => {
 // Manual rollover (archive now + reset). Secured by ADMIN_SECRET or INBOUND_SECRET.
 app.post('/c/:slug/api/archive-now', (req, res) => {
   const raw = (req.params.slug || '').toLowerCase();
-  const { archive, storePath, todayPdf, slug } = slugDirs(raw);
+  const { archive, publicArchive, storePath, todayPdf, slug } = slugDirs(raw);
 
   const sec = (req.query.secret || req.headers['x-admin-secret'] || req.headers['x-inbound-secret'] || '').toString();
   const okSecret = (ADMIN_SECRET && sec === ADMIN_SECRET) || (INBOUND_SECRET && sec === INBOUND_SECRET);
@@ -303,19 +318,22 @@ app.post('/c/:slug/api/archive-now', (req, res) => {
   const store = loadStore(storePath);
   writeTodayPdf(todayPdf, slug, store.items || []);
 
-  // Copy to archive
-  const out = path.join(archive, `qa-${day}.pdf`);
-  try {
-    fs.copyFileSync(todayPdf, out);
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: 'copy_failed', detail: String(e) });
+  // Copy to both private and public archives with new naming
+  const filename = `${day}-${slug}.pdf`;
+  const outPrivate = path.join(archive, filename);
+  const outPublic  = path.join(publicArchive, filename);
+  try { fs.copyFileSync(todayPdf, outPrivate); } catch (e) {
+    return res.status(500).json({ ok: false, error: 'copy_private_failed', detail: String(e) });
+  }
+  try { fs.copyFileSync(todayPdf, outPublic); } catch (e) {
+    return res.status(500).json({ ok: false, error: 'copy_public_failed', detail: String(e) });
   }
 
   // Reset today
   saveStore(storePath, { items: [] });
   writeTodayPdf(todayPdf, slug, []);
 
-  return res.json({ ok: true, slug, archived: path.basename(out) });
+  return res.json({ ok: true, slug, archivedPrivate: path.basename(outPrivate), archivedPublic: path.basename(outPublic) });
 });
 
 // ------------ INBOUND (SendGrid Inbound Parse) ------------
@@ -446,7 +464,7 @@ app.post('/inbound', upload.any(), (req, res) => {
 });
 
 // ------------ NIGHTLY ARCHIVE/RESET (per company) ------------
-cron.schedule('5 0 * * *', () => {
+cron.schedule('59 23 * * *', () => {
   try {
     const zone = TIMEZONE;
     const day = DateTime.now().setZone(zone).toFormat('yyyy-LL-dd');
@@ -454,39 +472,57 @@ cron.schedule('5 0 * * *', () => {
 
     const slugs = listSlugs();
     slugs.forEach(slug => {
-      const { storePath, archive, todayPdf } = slugDirs(slug);
+      const { storePath, archive, publicArchive, todayPdf } = slugDirs(slug);
+
       // ensure today's pdf exists before copying
       const store = loadStore(storePath);
       if (!fs.existsSync(todayPdf)) writeTodayPdf(todayPdf, slug, store.items || []);
 
-      // copy today PDF to archive
-      if (fs.existsSync(todayPdf)) {
-        const out = path.join(archive, `qa-${day}.pdf`);
-        try {
-          fs.copyFileSync(todayPdf, out);
-          console.log('Archived PDF', { slug, out });
-        } catch (e) {
-          console.error('Archive copy failed', { slug, e: String(e) });
-        }
+      // Copy today PDF to both private and public archives with date-first filename
+      const filename = `${day}-${slug}.pdf`;
+      try {
+        fs.copyFileSync(todayPdf, path.join(archive, filename));
+      } catch (e) {
+        console.error('Archive copy (private) failed', { slug, e: String(e) });
       }
+      try {
+        fs.copyFileSync(todayPdf, path.join(publicArchive, filename));
+      } catch (e) {
+        console.error('Archive copy (public) failed', { slug, e: String(e) });
+      }
+      console.log('Archived PDF', { slug, private: path.join(archive, filename), public: path.join(publicArchive, filename) });
 
       // reset today's store and PDF
       saveStore(storePath, { items: [] });
       writeTodayPdf(todayPdf, slug, []);
 
-      // purge old archives (optional)
+      // purge old archives (private + public)
       try {
-        const files = fs.readdirSync(archive);
-        files.forEach(f => {
-          if (!/^qa-\d{4}-\d{2}-\d{2}\.pdf$/i.test(f)) return;
-          const d = f.slice(3, 13); // yyyy-mm-dd
+        const filesPriv = fs.readdirSync(archive);
+        filesPriv.forEach(f => {
+          if (!/^\d{4}-\d{2}-\d{2}-[a-z0-9-_]+\.pdf$/i.test(f)) return;
+          const d = f.slice(0, 10); // yyyy-mm-dd
           const dt = DateTime.fromFormat(d, 'yyyy-LL-dd');
           if (dt.isValid && dt < cutoff) {
             fs.unlinkSync(path.join(archive, f));
           }
         });
       } catch (e) {
-        console.error('Archive purge failed', { slug, e: String(e) });
+        console.error('Archive purge failed (private)', { slug, e: String(e) });
+      }
+
+      try {
+        const filesPub = fs.readdirSync(publicArchive);
+        filesPub.forEach(f => {
+          if (!/^\d{4}-\d{2}-\d{2}-[a-z0-9-_]+\.pdf$/i.test(f)) return;
+          const d = f.slice(0, 10); // yyyy-mm-dd
+          const dt = DateTime.fromFormat(d, 'yyyy-LL-dd');
+          if (dt.isValid && dt < cutoff) {
+            fs.unlinkSync(path.join(publicArchive, f));
+          }
+        });
+      } catch (e) {
+        console.error('Archive purge failed (public)', { slug, e: String(e) });
       }
     });
   } catch (e) {
