@@ -619,10 +619,7 @@ cron.schedule('59 23 * * *', () => {
     slugs.forEach(slug => {
       const { storePath, archive, publicArchive, todayPdf } = slugDirs(slug);
 
-      // ensure today's pdf exists before copying
-      const { storePath, archive, publicArchive } = slugDirs(slug);
-
-// ensure escalation-qa.pdf exists before copying
+     // ensure escalation-qa.pdf exists before copying
 const store = loadStore(storePath);
 writeTodayPdf(slug, store.items || []);
 
