@@ -9,7 +9,15 @@ const PDFDocument = require('pdfkit');
 const cron = require('node-cron');
 const { DateTime } = require('luxon');
 const cors = require('cors');
+const fetch = require('node-fetch');
 
+// DocsBot + Desktop mirror config
+const DOCSBOT_API_KEY = process.env.DOCSBOT_API_KEY; // put your real key in Render env
+const DOCSBOT_MAP = {
+  "1stanswerbot": "Tuy1mgF9xidg0KhsHmMr/eF9K4VnlybhOGpIqz0iH",
+  "serverpartners": "Tuy1mgF9xidg0KhsHmMr/CHJTUkAyMBecrlVp51Zq"
+};
+const DESKTOP_PATH = "/Users/ethanpoto/Desktop/docsbot-backend"; // desktop mirror root
 // ------------ CONFIG ------------
 const PORT = process.env.PORT || 3000;
 const TIMEZONE = process.env.TIMEZONE || 'America/Indiana/Indianapolis';
@@ -65,7 +73,7 @@ function slugDirs(slug) {
 
   // PUBLIC side
   const publicSlug = path.join(PUBLIC_DIR, safe);
-  const publicArchive = path.join(publicSlug, 'archive'); // NEW
+  const publicArchive = path.join(publicSlug, 'archive');
 
   const storePath = path.join(base, 'qa_store.json');
   const todayPdf = path.join(publicSlug, 'qa-today.pdf');
@@ -91,7 +99,11 @@ function displayNameFromSlug(slug = '') {
   return cleaned.replace(/\b\w/g, c => c.toUpperCase());
 }
 
-function writeTodayPdf(pdfPath, slug, items) {
+function writeTodayPdf(slug, items) {
+  const pdfName = 'escalation-qa.pdf';
+  const { publicSlug } = slugDirs(slug);
+  const pdfPath = path.join(publicSlug, pdfName);
+
   const doc = new PDFDocument({ size: 'LETTER', margin: 40 });
   const tmp = pdfPath + '.tmp';
   const stream = fs.createWriteStream(tmp);
@@ -99,13 +111,13 @@ function writeTodayPdf(pdfPath, slug, items) {
 
   const ts = DateTime.now().setZone(TIMEZONE).toFormat('yyyy-LL-dd HH:mm');
   const company = displayNameFromSlug(slug);
-  doc.fontSize(18).text(`Q/A — ${company} (Today)`, { underline: true });
+  doc.fontSize(18).text(`Escalation Q/A — ${company}`, { underline: true });
   doc.moveDown(0.25);
   doc.fontSize(10).text(`Generated: ${ts} ${TIMEZONE}`);
   doc.moveDown();
 
   if (!items.length) {
-    doc.fontSize(12).text('No entries yet for today.');
+    doc.fontSize(12).text('No entries yet.');
   } else {
     items.forEach((it, i) => {
       const ans = (it.a && String(it.a).trim()) ? it.a : '(pending)';
@@ -117,23 +129,90 @@ function writeTodayPdf(pdfPath, slug, items) {
       doc.moveTo(40, doc.y).lineTo(550, doc.y).stroke();
     });
   }
+
   doc.end();
   stream.on('finish', () => {
-    try { fs.renameSync(tmp, pdfPath); } catch {}
+    try {
+      fs.renameSync(tmp, pdfPath);
+      // Mirror to Desktop for visual confirmation
+      const destDir = path.join('/Users/ethanpoto/Desktop/docsbot-backend', slug);
+      fs.mkdirSync(destDir, { recursive: true });
+      fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
+    } catch (e) {
+      console.error('PDF save/mirror error', e);
+    }
+  });
+}
+
+
+// --- Entity decode + robust HTML→text ---
+function writeTodayPdf(slug, items) {
+  const pdfName = 'escalation-qa.pdf';
+  const { publicSlug } = slugDirs(slug);
+  const pdfPath = path.join(publicSlug, pdfName);
+
+  const doc = new PDFDocument({ size: 'LETTER', margin: 40 });
+  const tmp = pdfPath + '.tmp';
+  const stream = fs.createWriteStream(tmp);
+  doc.pipe(stream);
+
+  const ts = DateTime.now().setZone(TIMEZONE).toFormat('yyyy-LL-dd HH:mm');
+  const company = displayNameFromSlug(slug);
+  doc.fontSize(18).text(`Escalation Q/A — ${company}`, { underline: true });
+  doc.moveDown(0.25);
+  doc.fontSize(10).text(`Generated: ${ts} ${TIMEZONE}`);
+  doc.moveDown();
+
+  if (!items.length) {
+    doc.fontSize(12).text('No entries yet.');
+  } else {
+    items.forEach((it, i) => {
+      const ans = (it.a && String(it.a).trim()) ? it.a : '(pending)';
+      doc.moveDown(0.5);
+      doc.fontSize(13).text(`${i + 1}. Q: ${it.q}`);
+      doc.moveDown(0.2);
+      doc.fontSize(12).text(`   A: ${ans}`);
+      doc.moveDown(0.4);
+      doc.moveTo(40, doc.y).lineTo(550, doc.y).stroke();
+    });
+  }
+
+  doc.end();
+  stream.on('finish', () => {
+    try {
+      fs.renameSync(tmp, pdfPath);
+      // Mirror to Desktop for visual confirmation
+      const destDir = path.join(DESKTOP_PATH, slug);
+      fs.mkdirSync(destDir, { recursive: true });
+      fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
+    } catch (e) {
+      console.error('PDF save/mirror error', e);
+    }
   });
 }
 
 // Robust text extraction from HTML (if only HTML is provided)
 function htmlToText(html) {
   if (!html) return '';
-  return String(html)
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<[^>]+>/g, '')
-    .replace(/\r/g, '')
-    .trim();
+  let out = String(html);
+
+  // Keep structure
+  out = out.replace(/<(\/p|br|\/li|\/div)>/gi, '$&\n');
+
+  // Strip style/script
+  out = out.replace(/<style[\s\S]*?<\/style>/gi, '')
+           .replace(/<script[\s\S]*?<\/script>/gi, '');
+
+  // Strip tags
+  out = out.replace(/<[^>]+>/g, '');
+
+  // Decode entities
+  out = decodeEntities(out);
+
+  // Normalize and trim
+  out = out.replace(/\r/g, '').trim();
+
+  return out;
 }
 
 function listSlugs() {
@@ -144,19 +223,42 @@ function listSlugs() {
 }
 
 /**
- * Prefer the replies.* address from envelope/headers when multiple recipients exist.
+ * Find ALL qa+...@replies... recipients in To and CC (header preferred) or envelope.
+ * We will REJECT if more than one tenant candidate is present to prevent cross-tenant bleed.
  */
-function pickInboundAddress(fields = {}) {
-  let rcpts = [];
+function findQaRepliesCandidates(fields = {}, debug = false) {
+  const splitList = (s) => String(s || '')
+    .split(',')
+    .map(x => x.trim())
+    .filter(Boolean);
+
+  // HEADER SOURCES: To + CC (Mailio often puts QA in CC)
+  const toHeaderList = splitList(fields.to);
+  const ccHeaderList = splitList(fields.cc);
+  const headerAll = [...toHeaderList, ...ccHeaderList];
+
+  const headerCandidates = headerAll.filter(addr =>
+    /@.*replies\./i.test(addr) && /^qa\+/i.test((addr.split('@')[0] || ''))
+  );
+
+  // ENVELOPE (fallback)
+  let envTo = [];
   try {
     const env = JSON.parse(fields.envelope || '{}');
-    rcpts = Array.isArray(env.to) ? env.to : (env.to ? [env.to] : []);
+    envTo = Array.isArray(env.to) ? env.to : (env.to ? [env.to] : []);
   } catch {}
-  if (!rcpts.length && fields.to) {
-    rcpts = String(fields.to).split(',').map(s => s.trim());
-  }
-  const picked = rcpts.find(x => /\.replies\./i.test(x)) || rcpts[0] || '';
-  return picked;
+  const envCandidates = envTo.filter(addr =>
+    /@.*replies\./i.test(addr) && /^qa\+/i.test((addr.split('@')[0] || ''))
+  );
+
+  const candidates = headerCandidates.length ? headerCandidates : envCandidates;
+
+  if (debug) console.log('QA RECIPIENT CANDIDATES', {
+    toHeaderList, ccHeaderList, headerCandidates, envCandidates,
+    pickedFrom: headerCandidates.length ? 'header' : 'envelope'
+  });
+
+  return candidates;
 }
 
 /**
@@ -191,6 +293,13 @@ function deriveSlugFromAddress(toAddrRaw = '') {
   return 'default';
 }
 
+// --- NEW: tenant tag extractor ---
+function extractTenantTag(s) {
+  // Matches "[tenant: slug]" at the very start (allow whitespace)
+  const m = String(s || '').match(/^\s*\[\s*tenant\s*:\s*([a-z0-9][a-z0-9-_]{0,63})\s*\]/i);
+  return m ? m[1].toLowerCase() : '';
+}
+
 /**
  * Parse inbound body to detect:
  *   - QA: both Q and A present
@@ -202,14 +311,15 @@ function deriveSlugFromAddress(toAddrRaw = '') {
 function parseQAOrAnswerOnly(raw = '') {
   const t = String(raw || '');
 
-  // Grab first Q: line (if any)
-  const qMatch = t.match(/^\s*Q:\s*(.+)$/im);
+  // Slightly more forgiving Q: pattern (Q: / Q- / Q – )
+  const qMatch = t.match(/^\s*Q\s*[:\-–]\s*(.+)$/im);
+
   // Grab first A: block (if any) — everything until a common quote marker or another Q:
-  let aMatch = t.match(/^\s*A:\s*([\s\S]+)$/im);
+  let aMatch = t.match(/^\s*A\s*:\s*([\s\S]+)$/im);
   let aText = '';
   if (aMatch) {
     aText = aMatch[1];
-    const cutAt = aText.search(/^\s*(Q:|On .* wrote:|From:|Sent:|-----|>)/im);
+    const cutAt = aText.search(/^\s*(Q\s*[:\-–]|On .* wrote:|From:|Sent:|-----|>)/im);
     if (cutAt > -1) aText = aText.slice(0, cutAt);
     aText = aText.trim();
   }
@@ -248,7 +358,8 @@ app.get('/c/:slug/api/status', (req, res) => {
   if (!raw) return res.status(400).json({ error: 'missing slug' });
   const { storePath, slug } = slugDirs(raw);
   const store = loadStore(storePath);
-  const todayPdfUrl = `${BASE_URL}/public/${encodeURIComponent(slug)}/qa-today.pdf`;
+  const todayPdfUrl = `${BASE_URL}/public/${encodeURIComponent(slug)}/escalation-qa.pdf`;
+
   res.json({ slug, count: store.items.length, todayPdfUrl });
 });
 
@@ -266,16 +377,16 @@ app.get('/c/:slug/api/peek', (req, res) => {
 function listArchiveFiles(archiveDir) {
   try {
     const files = fs.readdirSync(archiveDir)
-      .filter(f => /^\d{4}-\d{2}-\d{2}-[a-z0-9-_]+\.pdf$/i.test(f)) // NEW pattern
-      .sort() // ascending by name (date-first)
-      .reverse(); // most recent first
+      .filter(f => /^\d{4}-\d{2}-\d{2}-[a-z0-9-_]+\.pdf$/i.test(f)) // date-first + slug
+      .sort()
+      .reverse();
     return files;
   } catch {
     return [];
   }
 }
 
-// List archives with direct URLs (now points to PUBLIC archive)
+// List archives with direct URLs (PUBLIC archive)
 app.get('/c/:slug/api/archives', (req, res) => {
   const raw = (req.params.slug || '').toLowerCase();
   const { publicArchive, slug } = slugDirs(raw);
@@ -288,7 +399,7 @@ app.get('/c/:slug/api/archives', (req, res) => {
   res.json({ slug, count: items.length, items });
 });
 
-// Serve a specific archived PDF (now from PUBLIC archive, supports new filename)
+// Serve a specific archived PDF
 app.get('/c/:slug/archive/:file', (req, res) => {
   const raw = (req.params.slug || '').toLowerCase();
   const file = String(req.params.file || '');
@@ -315,26 +426,25 @@ app.post('/c/:slug/api/archive-now', (req, res) => {
   const day = now.toFormat('yyyy-LL-dd');
 
   // Ensure today's PDF reflects current store
+    // Ensure escalation PDF reflects current store
   const store = loadStore(storePath);
-  writeTodayPdf(todayPdf, slug, store.items || []);
+  writeTodayPdf(slug, store.items || []);
 
-  // Copy to both private and public archives with new naming
+  // Copy to both private and public archives (from escalation-qa.pdf)
   const filename = `${day}-${slug}.pdf`;
+  const srcPdf = path.join(PUBLIC_DIR, slug, 'escalation-qa.pdf');
   const outPrivate = path.join(archive, filename);
   const outPublic  = path.join(publicArchive, filename);
-  try { fs.copyFileSync(todayPdf, outPrivate); } catch (e) {
+  try { fs.copyFileSync(srcPdf, outPrivate); } catch (e) {
     return res.status(500).json({ ok: false, error: 'copy_private_failed', detail: String(e) });
   }
-  try { fs.copyFileSync(todayPdf, outPublic); } catch (e) {
+  try { fs.copyFileSync(srcPdf, outPublic); } catch (e) {
     return res.status(500).json({ ok: false, error: 'copy_public_failed', detail: String(e) });
   }
 
-  // Reset today
+  // Reset store and rewrite an empty escalation file
   saveStore(storePath, { items: [] });
-  writeTodayPdf(todayPdf, slug, []);
-
-  return res.json({ ok: true, slug, archivedPrivate: path.basename(outPrivate), archivedPublic: path.basename(outPublic) });
-});
+  writeTodayPdf(slug, []);
 
 // ------------ INBOUND (SendGrid Inbound Parse) ------------
 app.post('/inbound', upload.any(), (req, res) => {
@@ -353,22 +463,53 @@ app.post('/inbound', upload.any(), (req, res) => {
 
     const fields = Object.fromEntries(Object.entries(req.body || {}));
 
-    // Prefer replies.* recipient to derive slug
-    const toAddr = pickInboundAddress(fields);
-    const derivedSlug = deriveSlugFromAddress(toAddr);
+    // Optional override for testing: ?forceSlug=<tenant>
+    const forceSlug = (req.query.forceSlug || '').toString().trim();
+    let derivedSlug = '';
 
-    // Prefer plain text; otherwise convert HTML to text
-    const bodyText =
+    // Prefer plain text; otherwise convert HTML to text (declared 'let' so we can strip the tenant tag)
+    let bodyText =
       (fields.text && fields.text.trim())
         ? fields.text
         : htmlToText(fields.html || '');
+
+    // Extract tenant tag from the very first line, e.g., "[tenant: serverpartners]"
+    const tagSlug = extractTenantTag(bodyText);
+
+    if (forceSlug) {
+      derivedSlug = forceSlug.toLowerCase().replace(/[^a-z0-9-_]/g, '');
+      if (DEBUG_INBOUND) console.log('FORCED_SLUG', { derivedSlug });
+    } else {
+      const candidates = findQaRepliesCandidates(fields, DEBUG_INBOUND);
+      if (!candidates.length) {
+        if (DEBUG_INBOUND) console.warn('No qa+...@replies... recipient found', { to: fields.to, cc: fields.cc, envelope: fields.envelope });
+        return res.status(200).json({ ok: false, error: 'no_tenant_recipient' });
+      }
+      if (candidates.length > 1) {
+        if (DEBUG_INBOUND) console.warn('Multiple tenant recipients in one email — rejecting to prevent cross-tenant update', { candidates });
+        return res.status(200).json({ ok: false, error: 'multiple_tenant_recipients', candidates });
+      }
+      derivedSlug = deriveSlugFromAddress(candidates[0]);
+    }
+
+    // If a tenant tag exists and doesn't match the derived slug, ignore this webhook
+    if (tagSlug && tagSlug !== derivedSlug) {
+      if (DEBUG_INBOUND) console.warn('Tenant tag mismatch — ignoring message', { tagSlug, derivedSlug });
+      return res.status(200).json({ ok: true, ignored: true, reason: 'tenant_tag_mismatch', tagSlug, derivedSlug });
+    }
+
+    // If the tag matches, strip the tag line before parsing so it doesn’t appear in PDFs
+    if (tagSlug) {
+      const i = bodyText.indexOf('\n');
+      bodyText = (i >= 0 ? bodyText.slice(i + 1) : '').trim();
+    }
 
     const parsed = parseQAOrAnswerOnly(bodyText);
     if (DEBUG_INBOUND) console.log('INBOUND PARSED', { slug: derivedSlug, mode: parsed.mode, hasQ: !!parsed.q, hasA: !!parsed.a });
 
     if (parsed.mode === 'NONE') {
-      if (DEBUG_INBOUND) console.warn('Inbound parse failed (no Q:/A:)', { derivedSlug, toAddr, sample: bodyText.slice(0, 200) });
-      return res.status(200).json({ ok: false, error: 'No Q:/A: found' });
+      if (DEBUG_INBOUND) console.warn('Inbound parse failed (no Q:/A:)', { derivedSlug, sample: bodyText.slice(0, 200) });
+      return res.status(200).json({ ok: false, error: 'no_q_or_a_found' });
     }
 
     const { storePath, todayPdf, slug } = slugDirs(derivedSlug);
@@ -437,13 +578,17 @@ app.post('/inbound', upload.any(), (req, res) => {
     }
 
     saveStore(storePath, store);
-    writeTodayPdf(todayPdf, slug, store.items);
+    writeTodayPdf(slug, store.items);
+    refreshDocsBot(slug);
 
     // (Optional) persist raw inbound for debugging
     if (DEBUG_INBOUND) {
       try {
         const dbg = {
-          to: toAddr,
+          to: fields.to || '',
+          cc: fields.cc || '',
+          envelope: fields.envelope || '',
+          derivedSlug: slug,
           subject: fields.subject || '',
           receivedAt: new Date().toISOString(),
           parsed
@@ -475,26 +620,31 @@ cron.schedule('59 23 * * *', () => {
       const { storePath, archive, publicArchive, todayPdf } = slugDirs(slug);
 
       // ensure today's pdf exists before copying
-      const store = loadStore(storePath);
-      if (!fs.existsSync(todayPdf)) writeTodayPdf(todayPdf, slug, store.items || []);
+      const { storePath, archive, publicArchive } = slugDirs(slug);
 
-      // Copy today PDF to both private and public archives with date-first filename
-      const filename = `${day}-${slug}.pdf`;
-      try {
-        fs.copyFileSync(todayPdf, path.join(archive, filename));
-      } catch (e) {
-        console.error('Archive copy (private) failed', { slug, e: String(e) });
-      }
-      try {
-        fs.copyFileSync(todayPdf, path.join(publicArchive, filename));
-      } catch (e) {
-        console.error('Archive copy (public) failed', { slug, e: String(e) });
-      }
-      console.log('Archived PDF', { slug, private: path.join(archive, filename), public: path.join(publicArchive, filename) });
+// ensure escalation-qa.pdf exists before copying
+const store = loadStore(storePath);
+writeTodayPdf(slug, store.items || []);
 
-      // reset today's store and PDF
-      saveStore(storePath, { items: [] });
-      writeTodayPdf(todayPdf, slug, []);
+// Copy escalation file to both private and public archives with date-first filename
+const filename = `${day}-${slug}.pdf`;
+const srcPdf = path.join(PUBLIC_DIR, slug, 'escalation-qa.pdf');
+try {
+  fs.copyFileSync(srcPdf, path.join(archive, filename));
+} catch (e) {
+  console.error('Archive copy (private) failed', { slug, e: String(e) });
+}
+try {
+  fs.copyFileSync(srcPdf, path.join(publicArchive, filename));
+} catch (e) {
+  console.error('Archive copy (public) failed', { slug, e: String(e) });
+}
+console.log('Archived PDF', { slug, private: path.join(archive, filename), public: path.join(publicArchive, filename) });
+
+// reset store and rewrite an empty escalation file
+saveStore(storePath, { items: [] });
+writeTodayPdf(slug, []);
+
 
       // purge old archives (private + public)
       try {
@@ -514,8 +664,8 @@ cron.schedule('59 23 * * *', () => {
       try {
         const filesPub = fs.readdirSync(publicArchive);
         filesPub.forEach(f => {
-          if (!/^\d{4}-\d{2}-\d{2}-[a-z0-9-_]+\.pdf$/i.test(f)) return;
-          const d = f.slice(0, 10); // yyyy-mm-dd
+          if (!/^\d{4}-\d{2}-\d2-[a-z0-9-_]+\.pdf$/i.test(f)) return;
+          const d = f.slice(0, 10);
           const dt = DateTime.fromFormat(d, 'yyyy-LL-dd');
           if (dt.isValid && dt < cutoff) {
             fs.unlinkSync(path.join(publicArchive, f));
@@ -534,16 +684,17 @@ cron.schedule('59 23 * * *', () => {
 (function ensureBootPdfs() {
   // Create an empty "today" PDF for any existing slugs on boot
   listSlugs().forEach(slug => {
-    const { storePath, todayPdf } = slugDirs(slug);
-    const store = loadStore(storePath);
-    writeTodayPdf(todayPdf, slug, store.items || []);
-  });
+  const { storePath } = slugDirs(slug);
+  const store = loadStore(storePath);
+  writeTodayPdf(slug, store.items || []);
+});
 })();
 
 // ------------ START ------------
 app.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
-  console.log(`Health: /health  Status: /api/status  Company status: /c/:slug/api/status  Peek: /c/:slug/api/peek  Archives: /c/:slug/api/archives  Download: /c/:slug/archive/:file  PDFs under /public/:slug/qa-today.pdf`);
+  console.log(`Health: /health  Status: /api/status  Company status: /c/:slug/api/status  Peek: /c/:slug/api/peek  Archives: /c/:slug/api/archives  Download: /c/:slug/archive/:file  PDFs under /public/:slug/escalation-qa.pdf
+);
 });
 
 // Graceful-ish error logs
