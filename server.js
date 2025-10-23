@@ -99,52 +99,8 @@ function displayNameFromSlug(slug = '') {
   return cleaned.replace(/\b\w/g, c => c.toUpperCase());
 }
 
-function writeTodayPdf(slug, items) {
-  const pdfName = 'escalation-qa.pdf';
-  const { publicSlug } = slugDirs(slug);
-  const pdfPath = path.join(publicSlug, pdfName);
 
-  const doc = new PDFDocument({ size: 'LETTER', margin: 40 });
-  const tmp = pdfPath + '.tmp';
-  const stream = fs.createWriteStream(tmp);
-  doc.pipe(stream);
-
-  const ts = DateTime.now().setZone(TIMEZONE).toFormat('yyyy-LL-dd HH:mm');
-  const company = displayNameFromSlug(slug);
-  doc.fontSize(18).text(`Escalation Q/A — ${company}`, { underline: true });
-  doc.moveDown(0.25);
-  doc.fontSize(10).text(`Generated: ${ts} ${TIMEZONE}`);
-  doc.moveDown();
-
-  if (!items.length) {
-    doc.fontSize(12).text('No entries yet.');
-  } else {
-    items.forEach((it, i) => {
-      const ans = (it.a && String(it.a).trim()) ? it.a : '(pending)';
-      doc.moveDown(0.5);
-      doc.fontSize(13).text(`${i + 1}. Q: ${it.q}`);
-      doc.moveDown(0.2);
-      doc.fontSize(12).text(`   A: ${ans}`);
-      doc.moveDown(0.4);
-      doc.moveTo(40, doc.y).lineTo(550, doc.y).stroke();
-    });
-  }
-
-  doc.end();
-  stream.on('finish', () => {
-    try {
-      fs.renameSync(tmp, pdfPath);
-      // Mirror to Desktop for visual confirmation
-      const destDir = path.join('/Users/ethanpoto/Desktop/docsbot-backend', slug);
-      fs.mkdirSync(destDir, { recursive: true });
-      fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
-    } catch (e) {
-      console.error('PDF save/mirror error', e);
-    }
-  });
-}
-
-
+  
 // --- Entity decode + robust HTML→text ---
 function writeTodayPdf(slug, items) {
   const pdfName = 'escalation-qa.pdf';
@@ -445,6 +401,13 @@ app.post('/c/:slug/api/archive-now', (req, res) => {
   // Reset store and rewrite an empty escalation file
   saveStore(storePath, { items: [] });
   writeTodayPdf(slug, []);
+  return res.json({ 
+    ok: true, 
+    slug, 
+    archivedPrivate: path.basename(outPrivate), 
+    archivedPublic: path.basename(outPublic) 
+  });
+});
 
 // ------------ INBOUND (SendGrid Inbound Parse) ------------
 app.post('/inbound', upload.any(), (req, res) => {
@@ -690,9 +653,9 @@ writeTodayPdf(slug, []);
 // ------------ START ------------
 app.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
-  console.log(`Health: /health  Status: /api/status  Company status: /c/:slug/api/status  Peek: /c/:slug/api/peek  Archives: /c/:slug/api/archives  Download: /c/:slug/archive/:file  PDFs under /public/:slug/escalation-qa.pdf
-);
+  console.log(`Health: /health  Status: /api/status  Company status: /c/:slug/api/status  Peek: /c/:slug/api/peek  Archives: /c/:slug/api/archives  Download: /c/:slug/archive/:file  PDFs under /public/:slug/escalation-qa.pdf`);
 });
+
 
 // Graceful-ish error logs
 process.on('unhandledRejection', err => console.error('UNHANDLED REJECTION', err));
