@@ -18,6 +18,47 @@ const DOCSBOT_MAP = {
   "serverpartners": "Tuy1mgF9xidg0KhsHmMr/CHJTUkAyMBecrlVp51Zq"
 };
 const DESKTOP_PATH = "/Users/ethanpoto/Desktop/docsbot-backend"; // desktop mirror root
+// ---- DocsBot Refresh Helper ----
+async function refreshDocsBot(slug) {
+  try {
+    const teamId = "Tuy1mgF9xidg0KhsHmMr"; // your DocsBot team ID
+    const DOCSBOT_MAP = {
+      "1stanswerbot": "Tuy1mgF9xidg0KhsHmMr/eF9K4VnlybhOGpIqz0iH",
+      "serverpartners": "Tuy1mgF9xidg0KhsHmMr/CHJTUkAyMBecrlVp51Zq"
+    };
+
+    const botId = DOCSBOT_MAP[slug];
+    if (!botId) {
+      console.warn(`⚠️ No DocsBot mapping for slug: ${slug}`);
+      return;
+    }
+
+    const url = `https://docsbot.ai/api/v1/admin/teams/${teamId}/bots/${botId}/sources`;
+    const pdfUrl = `${BASE_URL}/public/${slug}/escalation-qa.pdf`;
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.DOCSBOT_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        type: "url",
+        value: pdfUrl,
+        title: "Escalation Q/A"
+      })
+    });
+
+    if (response.ok) {
+      console.log(`✅ DocsBot refreshed for ${slug}: ${pdfUrl}`);
+    } else {
+      console.error(`❌ DocsBot refresh failed for ${slug}: ${response.status}`);
+    }
+  } catch (err) {
+    console.error(`Error refreshing DocsBot for ${slug}:`, err);
+  }
+}
+
 // ------------ CONFIG ------------
 const PORT = process.env.PORT || 3000;
 const TIMEZONE = process.env.TIMEZONE || 'America/Indiana/Indianapolis';
