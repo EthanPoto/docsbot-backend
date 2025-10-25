@@ -145,21 +145,21 @@ function displayNameFromSlug(slug = '') {
   
 // --- Entity decode + robust HTML→text ---
 function writeTodayPdf(pdfPath, slug, items) {
-  const PDFDocument = require('pdfkit');
-  const fs = require('fs');
-  const path = require('path');
-  const { DateTime } = require('luxon');
+  const PDFDocument = require("pdfkit");
+  const fs = require("fs");
+  const path = require("path");
+  const { DateTime } = require("luxon");
 
-  // Make sure target directory exists
+  // Make sure directory exists for PDF output
   const publicSlug = path.dirname(pdfPath);
   fs.mkdirSync(publicSlug, { recursive: true });
 
-  const doc = new PDFDocument({ size: 'LETTER', margin: 40 });
-  const tmp = pdfPath + '.tmp';
+  const doc = new PDFDocument({ size: "LETTER", margin: 40 });
+  const tmp = pdfPath + ".tmp";
   const stream = fs.createWriteStream(tmp);
   doc.pipe(stream);
 
-  const ts = DateTime.now().setZone(TIMEZONE).toFormat('yyyy-LL-dd HH:mm');
+  const ts = DateTime.now().setZone(TIMEZONE).toFormat("yyyy-LL-dd HH:mm");
   const company = displayNameFromSlug(slug);
 
   doc.fontSize(18).text(`Escalation Q/A — ${company}`, { underline: true });
@@ -168,10 +168,10 @@ function writeTodayPdf(pdfPath, slug, items) {
   doc.moveDown();
 
   if (!items.length) {
-    doc.fontSize(12).text('No entries yet.');
+    doc.fontSize(12).text("No entries yet.");
   } else {
     items.forEach((it, i) => {
-      const ans = (it.a && String(it.a).trim()) ? it.a : '(pending)';
+      const ans = it.a && String(it.a).trim() ? it.a : "(pending)";
       doc.moveDown(0.5);
       doc.fontSize(13).text(`${i + 1}. Q: ${it.q}`);
       doc.moveDown(0.2);
@@ -183,29 +183,35 @@ function writeTodayPdf(pdfPath, slug, items) {
 
   doc.end();
 
-  stream.on('finish', () => {
+  stream.on("finish", () => {
     try {
+      // rename temp file to final
       fs.renameSync(tmp, pdfPath);
 
-      // --- Mirror locally only if this is your Mac (NOT Render) ---
-      if (process.platform === 'darwin') {
+      // ---------- MIRROR LOCALLY ONLY WHEN ON MAC ----------
+      if (process.platform === "darwin") {
         try {
           const pdfName = path.basename(pdfPath);
-          const destDir = path.join('/Users/ethanpoto/Desktop/docsbot-backend', slug);
+          const destDir = path.join(
+            "/Users/ethanpoto/Desktop/docsbot-backend",
+            slug
+          );
           fs.mkdirSync(destDir, { recursive: true });
           fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
           console.log(`🖥️  Local copy saved for ${slug}`);
         } catch (mirrorErr) {
-          console.warn('⚠️  Desktop mirror skipped:', mirrorErr.message);
+          console.warn("⚠️  Desktop mirror skipped:", mirrorErr.message);
         }
       }
+      // -------------------------------------------------------
 
       console.log(`✅ PDF updated for ${slug}: ${pdfPath}`);
     } catch (err) {
-      console.error('❌ PDF save/mirror error', err);
+      console.error("❌ PDF save error:", err);
     }
   });
 }
+
 
 
 // Robust text extraction from HTML (if only HTML is provided)
