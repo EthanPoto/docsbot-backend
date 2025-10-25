@@ -144,15 +144,19 @@ function displayNameFromSlug(slug = '') {
 
   
 // --- Entity decode + robust HTML→text ---
-function writeTodayPdf(pdfPath, slug, items) {
+function writeTodayPdf(pdfPath, slug, items = []) {
   const PDFDocument = require("pdfkit");
   const fs = require("fs");
   const path = require("path");
   const { DateTime } = require("luxon");
 
+  // Ensure items is always an array
+  if (!Array.isArray(items)) items = [];
+
   // Make sure directory exists for PDF output
   const publicSlug = path.dirname(pdfPath);
   fs.mkdirSync(publicSlug, { recursive: true });
+
 
   const doc = new PDFDocument({ size: "LETTER", margin: 40 });
   const tmp = pdfPath + ".tmp";
