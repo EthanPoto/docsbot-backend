@@ -160,7 +160,7 @@ function writeTodayPdf(pdfPath, slug, items) {
   const path = require('path');
   const { DateTime } = require('luxon');
 
-  // Create directory if needed
+  // Make sure target directory exists
   const publicSlug = path.dirname(pdfPath);
   fs.mkdirSync(publicSlug, { recursive: true });
 
@@ -197,20 +197,26 @@ function writeTodayPdf(pdfPath, slug, items) {
     try {
       fs.renameSync(tmp, pdfPath);
 
-      // ✅ Mirror locally only on Mac (your machine)
+      // --- Mirror locally only if this is your Mac (NOT Render) ---
       if (process.platform === 'darwin') {
-        const pdfName = path.basename(pdfPath);
-        const destDir = path.join('/Users/ethanpoto/Desktop/docsbot-backend', slug);
-        fs.mkdirSync(destDir, { recursive: true });
-        fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
+        try {
+          const pdfName = path.basename(pdfPath);
+          const destDir = path.join('/Users/ethanpoto/Desktop/docsbot-backend', slug);
+          fs.mkdirSync(destDir, { recursive: true });
+          fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
+          console.log(`🖥️  Local copy saved for ${slug}`);
+        } catch (mirrorErr) {
+          console.warn('⚠️  Desktop mirror skipped:', mirrorErr.message);
+        }
       }
 
       console.log(`✅ PDF updated for ${slug}: ${pdfPath}`);
     } catch (err) {
-      console.error('PDF save/mirror error', err);
+      console.error('❌ PDF save/mirror error', err);
     }
   });
 }
+
 
 // Robust text extraction from HTML (if only HTML is provided)
 function htmlToText(html) {
