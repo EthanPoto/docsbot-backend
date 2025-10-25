@@ -19,43 +19,43 @@ const DOCSBOT_MAP = {
 };
 const DESKTOP_PATH = "/Users/ethanpoto/Desktop/docsbot-backend"; // desktop mirror root
 // ---- DocsBot Refresh Helper (force re-index) ----
+// ------------ DOCSBOT REFRESH HELPER ------------
 async function refreshDocsBot(slug) {
   try {
-    const teamId = "Tuy1mgF9xidg0KhsHmMr";
-    const DOCSBOT_MAP = {
-      "1stanswerbot": "Tuy1mgF9xidg0KhsHmMr/eF9K4VnlybhOGpIqz0iH",
-      "serverpartners": "Tuy1mgF9xidg0KhsHmMr/CHJTUkAyMBecrlVp51Zq"
+    const fetch = (await import('node-fetch')).default;
+
+    const botMap = {
+      '1stanswerbot': 'Tuy1mgF9xidg0KhsHmMr/eF9K4VnlybhOGpIqz0iH',
+      'serverpartners': 'Tuy1mgF9xidg0KhsHmMr/CHJTUkAyMBecrlVp51Zq'
     };
 
-    const botId = DOCSBOT_MAP[slug];
-    if (!botId) return console.warn(`⚠️ No DocsBot mapping for slug: ${slug}`);
+    const botId = botMap[slug] || null;
+    if (!botId) {
+      console.warn(`⚠️  No DocsBot ID for slug: ${slug}`);
+      return;
+    }
 
-    const url = `https://docsbot.ai/api/v1/admin/teams/${teamId}/bots/${botId}/sources`;
     const pdfUrl = `${BASE_URL}/public/${slug}/escalation-qa.pdf`;
 
-    const response = await fetch(url, {
-      method: "POST",
+    const resp = await fetch(`https://docsbot.ai/api/v1/admin/teams/${DOCSBOT_TEAM_ID}/bots/${botId}/sources`, {
+      method: 'POST',
       headers: {
-        "Authorization": `Bearer ${process.env.DOCSBOT_API_KEY}`,
-        "Content-Type": "application/json"
+        'Authorization': `Bearer ${DOCSBOT_API_KEY.trim()}`,
+        'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        type: "url",
+        type: 'url',
         value: pdfUrl,
-        title: "Escalation Q/A",
-        replace: true,   // 🧠 this tells DocsBot to re-index immediately
+        title: 'Escalation Q/A',
+        replace: true,
         force: true
       })
     });
 
-    const data = await response.json();
-    if (response.ok) {
-      console.log(`✅ DocsBot re-index requested for ${slug}:`, data);
-    } else {
-      console.error(`❌ DocsBot refresh failed for ${slug}:`, response.status, data);
-    }
+    const data = await resp.json();
+    console.log(`✅ DocsBot re-index requested for ${slug}:`, data);
   } catch (err) {
-    console.error(`Error refreshing DocsBot for ${slug}:`, err);
+    console.error(`❌ Error refreshing DocsBot for ${slug}:`, err);
   }
 }
 
