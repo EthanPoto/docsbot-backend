@@ -12,26 +12,23 @@ const cors = require('cors');
 const fetch = require('node-fetch');
 
 // DocsBot + Desktop mirror config
-const DOCSBOT_API_KEY = process.env.DOCSBOT_API_KEY; // put your real key in Render env
+const DOCSBOT_API_KEY = (process.env.DOCSBOT_API_KEY || '').trim();
 const DOCSBOT_MAP = {
   "1stanswerbot": "Tuy1mgF9xidg0KhsHmMr/eF9K4VnlybhOGpIqz0iH",
   "serverpartners": "Tuy1mgF9xidg0KhsHmMr/CHJTUkAyMBecrlVp51Zq"
 };
 const DESKTOP_PATH = "/Users/ethanpoto/Desktop/docsbot-backend"; // desktop mirror root
-// ---- DocsBot Refresh Helper ----
+// ---- DocsBot Refresh Helper (force re-index) ----
 async function refreshDocsBot(slug) {
   try {
-    const teamId = "Tuy1mgF9xidg0KhsHmMr"; // your DocsBot team ID
+    const teamId = "Tuy1mgF9xidg0KhsHmMr";
     const DOCSBOT_MAP = {
       "1stanswerbot": "Tuy1mgF9xidg0KhsHmMr/eF9K4VnlybhOGpIqz0iH",
       "serverpartners": "Tuy1mgF9xidg0KhsHmMr/CHJTUkAyMBecrlVp51Zq"
     };
 
     const botId = DOCSBOT_MAP[slug];
-    if (!botId) {
-      console.warn(`⚠️ No DocsBot mapping for slug: ${slug}`);
-      return;
-    }
+    if (!botId) return console.warn(`⚠️ No DocsBot mapping for slug: ${slug}`);
 
     const url = `https://docsbot.ai/api/v1/admin/teams/${teamId}/bots/${botId}/sources`;
     const pdfUrl = `${BASE_URL}/public/${slug}/escalation-qa.pdf`;
@@ -45,9 +42,23 @@ async function refreshDocsBot(slug) {
       body: JSON.stringify({
         type: "url",
         value: pdfUrl,
-        title: "Escalation Q/A"
+        title: "Escalation Q/A",
+        replace: true,   // 🧠 this tells DocsBot to re-index immediately
+        force: true
       })
     });
+
+    const data = await response.json();
+    if (response.ok) {
+      console.log(`✅ DocsBot re-index requested for ${slug}:`, data);
+    } else {
+      console.error(`❌ DocsBot refresh failed for ${slug}:`, response.status, data);
+    }
+  } catch (err) {
+    console.error(`Error refreshing DocsBot for ${slug}:`, err);
+  }
+}
+
 
     if (response.ok) {
       console.log(`✅ DocsBot refreshed for ${slug}: ${pdfUrl}`);
@@ -178,15 +189,17 @@ function writeTodayPdf(slug, items) {
   stream.on('finish', () => {
     try {
       fs.renameSync(tmp, pdfPath);
-      // Mirror to Desktop for visual confirmation
-      const destDir = path.join(DESKTOP_PATH, slug);
-      fs.mkdirSync(destDir, { recursive: true });
-      fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
-    } catch (e) {
-      console.error('PDF save/mirror error', e);
-    }
-  });
+     // Mirror to Desktop only when running locally (not on Render)
+if (!process.env.RENDER) {
+  try {
+    const destDir = path.join('/Users/ethanpoto/Desktop/docsbot-backend', slug);
+    fs.mkdirSync(destDir, { recursive: true });
+    fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
+  } catch (err) {
+    console.warn('Desktop mirror skipped:', err.message);
+  }
 }
+
 
 // Robust text extraction from HTML (if only HTML is provided)
 function htmlToText(html) {
