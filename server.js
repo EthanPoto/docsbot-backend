@@ -158,6 +158,7 @@ function writeTodayPdf(slug, items) {
   const pdfName = 'escalation-qa.pdf';
   const { publicSlug } = slugDirs(slug);
   const pdfPath = path.join(publicSlug, pdfName);
+fs.mkdirSync(publicSlug, { recursive: true });
 
   const doc = new PDFDocument({ size: 'LETTER', margin: 40 });
   const tmp = pdfPath + '.tmp';
@@ -190,7 +191,8 @@ function writeTodayPdf(slug, items) {
     try {
       fs.renameSync(tmp, pdfPath);
      // Mirror to Desktop only when running locally (not on Render)
-if (!process.env.RENDER) {
+// Mirror to Desktop only if running on macOS (your local machine)
+if (process.platform === 'darwin') {
   try {
     const destDir = path.join('/Users/ethanpoto/Desktop/docsbot-backend', slug);
     fs.mkdirSync(destDir, { recursive: true });
@@ -199,6 +201,7 @@ if (!process.env.RENDER) {
     console.warn('Desktop mirror skipped:', err.message);
   }
 }
+
 
 
 // Robust text extraction from HTML (if only HTML is provided)
