@@ -154,11 +154,15 @@ function displayNameFromSlug(slug = '') {
 
   
 // --- Entity decode + robust HTML→text ---
-function writeTodayPdf(slug, items) {
-  const pdfName = 'escalation-qa.pdf';
-  const { publicSlug } = slugDirs(slug);
-  const pdfPath = path.join(publicSlug, pdfName);
-fs.mkdirSync(publicSlug, { recursive: true });
+function writeTodayPdf(pdfPath, slug, items) {
+  const PDFDocument = require('pdfkit');
+  const fs = require('fs');
+  const path = require('path');
+  const { DateTime } = require('luxon');
+
+  // Create directory if needed
+  const publicSlug = path.dirname(pdfPath);
+  fs.mkdirSync(publicSlug, { recursive: true });
 
   const doc = new PDFDocument({ size: 'LETTER', margin: 40 });
   const tmp = pdfPath + '.tmp';
@@ -167,6 +171,7 @@ fs.mkdirSync(publicSlug, { recursive: true });
 
   const ts = DateTime.now().setZone(TIMEZONE).toFormat('yyyy-LL-dd HH:mm');
   const company = displayNameFromSlug(slug);
+
   doc.fontSize(18).text(`Escalation Q/A — ${company}`, { underline: true });
   doc.moveDown(0.25);
   doc.fontSize(10).text(`Generated: ${ts} ${TIMEZONE}`);
@@ -187,22 +192,25 @@ fs.mkdirSync(publicSlug, { recursive: true });
   }
 
   doc.end();
+
   stream.on('finish', () => {
     try {
       fs.renameSync(tmp, pdfPath);
-     // Mirror to Desktop only when running locally (not on Render)
-// Mirror to Desktop only if running on macOS (your local machine)
-if (process.platform === 'darwin') {
-  try {
-    const destDir = path.join('/Users/ethanpoto/Desktop/docsbot-backend', slug);
-    fs.mkdirSync(destDir, { recursive: true });
-    fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
-  } catch (err) {
-    console.warn('Desktop mirror skipped:', err.message);
-  }
+
+      // ✅ Mirror locally only on Mac (your machine)
+      if (process.platform === 'darwin') {
+        const pdfName = path.basename(pdfPath);
+        const destDir = path.join('/Users/ethanpoto/Desktop/docsbot-backend', slug);
+        fs.mkdirSync(destDir, { recursive: true });
+        fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
+      }
+
+      console.log(`✅ PDF updated for ${slug}: ${pdfPath}`);
+    } catch (err) {
+      console.error('PDF save/mirror error', err);
+    }
+  });
 }
-
-
 
 // Robust text extraction from HTML (if only HTML is provided)
 function htmlToText(html) {
