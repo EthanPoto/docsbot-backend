@@ -60,17 +60,7 @@ async function refreshDocsBot(slug) {
 }
 
 
-    if (response.ok) {
-      console.log(`✅ DocsBot refreshed for ${slug}: ${pdfUrl}`);
-    } else {
-      console.error(`❌ DocsBot refresh failed for ${slug}: ${response.status}`);
-    }
-  } catch (err) {
-    console.error(`Error refreshing DocsBot for ${slug}:`, err);
-  }
-}
-
-// ------------ CONFIG ------------
+    // ------------ CONFIG ------------
 const PORT = process.env.PORT || 3000;
 const TIMEZONE = process.env.TIMEZONE || 'America/Indiana/Indianapolis';
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');        // persistent disk mount
