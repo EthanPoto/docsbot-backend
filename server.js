@@ -39,7 +39,7 @@ async function uploadToDocsBot(slug, pdfPath) {
     const apiKey = process.env.DOCSBOT_API_KEY;
 
     // STEP 1: Request a signed upload URL from DocsBot
-    const sourceUrl = `https://api.docsbot.ai/v1/teams/${teamId}/bots/${botId}/sources/upload`;
+    const sourceUrl = `https://docsbot.ai/api/teams/${process.env.DOCSBOT_TEAM_ID}/bots/${botId}/sources/upload`;
 
     console.log('📡 Requesting DocsBot signed URL for', slug, '→', sourceUrl);
 
