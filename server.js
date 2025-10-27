@@ -35,7 +35,8 @@ async function uploadToDocsBot(slug, pdfPath) {
     }
 
     // STEP 1: Request a signed upload URL from DocsBot's Sources Admin API
-    const sourceUrl = `https://api.docsbot.ai/v1/teams/${process.env.DOCSBOT_TEAM_ID}/bots/${encodeURIComponent(botId)}/sources/upload`;
+    const cleanBotId = botId.replace(/\//g, '%2F');
+    const sourceUrl = `https://api.docsbot.ai/v1/teams/${process.env.DOCSBOT_TEAM_ID}/bots/${cleanBotId}/sources/upload`;
     const response = await fetch(sourceUrl, {
       method: 'POST',
       headers: {
