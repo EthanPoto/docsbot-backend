@@ -18,46 +18,68 @@ const DOCSBOT_MAP = {
   "serverpartners": "Tuy1mgF9xidg0KhsHmMr/CHJTUkAyMBecrlVp51Zq"
 };
 const DESKTOP_PATH = "/Users/ethanpoto/Desktop/docsbot-backend"; // desktop mirror root
-// ---- DocsBot Refresh Helper (force re-index) ----
-// ------------ DOCSBOT REFRESH HELPER ------------
-async function refreshDocsBot(slug) {
-  try {
-    const fetch = (await import('node-fetch')).default;
 
+// --- DOCSBOT AUTO-UPLOAD HELPER ---
+const fetch = require('node-fetch');
+
+async function uploadToDocsBot(slug, pdfPath) {
+  try {
+    // Map each company slug to its DocsBot bot ID
     const botMap = {
       '1stanswerbot': 'Tuy1mgF9xidg0KhsHmMr/eF9K4VnlybhOGpIqz0iH',
       'serverpartners': 'Tuy1mgF9xidg0KhsHmMr/CHJTUkAyMBecrlVp51Zq'
     };
 
-    const botId = botMap[slug] || null;
+    const botId = botMap[slug];
     if (!botId) {
-      console.warn(`⚠️  No DocsBot ID for slug: ${slug}`);
+      console.warn(`No DocsBot ID found for slug "${slug}", skipping upload.`);
       return;
     }
 
-    const pdfUrl = `${BASE_URL}/public/${slug}/escalation-qa.pdf`;
-
-    const resp = await fetch(`https://docsbot.ai/api/v1/admin/teams/${DOCSBOT_TEAM_ID}/bots/${botId}/sources`, {
+    // STEP 1: Request a signed upload URL from DocsBot's Sources Admin API
+    const sourceUrl = `https://api.docsbot.ai/v1/teams/${process.env.DOCSBOT_TEAM_ID}/bots/${encodeURIComponent(botId)}/sources/upload`;
+    const response = await fetch(sourceUrl, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${DOCSBOT_API_KEY.trim()}`,
+        'Authorization': `Bearer ${process.env.DOCSBOT_API_KEY}`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        type: 'url',
-        value: pdfUrl,
-        title: 'Escalation Q/A',
-        replace: true,
-        force: true
+        filename: path.basename(pdfPath),
+        mimetype: 'application/pdf'
       })
     });
 
-    const data = await resp.json();
-    console.log(`✅ DocsBot re-index requested for ${slug}:`, data);
+    if (!response.ok) {
+      console.error(`Failed to get signed URL for ${slug}:`, await response.text());
+      return;
+    }
+
+    const { upload_url } = await response.json();
+    if (!upload_url) {
+      console.error(`DocsBot did not return an upload_url for ${slug}`);
+      return;
+    }
+
+    // STEP 2: Upload the file directly to the signed URL
+    const fileBuffer = fs.readFileSync(pdfPath);
+    const uploadResp = await fetch(upload_url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: fileBuffer
+    });
+
+    if (!uploadResp.ok) {
+      console.error(`Upload to DocsBot failed for ${slug}:`, await uploadResp.text());
+      return;
+    }
+
+    console.log(`✅ DocsBot updated successfully for ${slug}: ${path.basename(pdfPath)}`);
   } catch (err) {
-    console.error(`❌ Error refreshing DocsBot for ${slug}:`, err);
+    console.error(`Error uploading to DocsBot for ${slug}:`, err);
   }
 }
+
 
 
     // ------------ CONFIG ------------
@@ -613,7 +635,8 @@ app.post('/inbound', upload.any(), (req, res) => {
 
     saveStore(storePath, store);
     writeTodayPdf(slug, store.items);
-    refreshDocsBot(slug);
+    uploadToDocsBot(slug, path.join(PUBLIC_DIR, slug, 'qa-today.pdf'));
+
 
     // (Optional) persist raw inbound for debugging
     if (DEBUG_INBOUND) {
