@@ -24,9 +24,9 @@ async function uploadToDocsBot(slug, pdfPath) {
   try {
     // Map each company slug to its DocsBot bot ID
     const botMap = {
-      '1stanswerbot': 'Tuy1mgF9xidg0KhsHmMr/eF9K4VnlybhOGpIqz0iH',
-      'serverpartners': 'Tuy1mgF9xidg0KhsHmMr/CHJTUkAyMBecrlVp51Zq'
-    };
+  '1stanswerbot': 'eF9K4VnlybhOGpIqz0iH',
+  'serverpartners': 'CHJTUkAyMBecrlVp51Zq'
+};
 
     const botId = botMap[slug];
     if (!botId) {
@@ -35,8 +35,7 @@ async function uploadToDocsBot(slug, pdfPath) {
     }
 
     // STEP 1: Request a signed upload URL from DocsBot's Sources Admin API
-    const cleanBotId = botId.replace(/\//g, '%2F');
-    const sourceUrl = `https://api.docsbot.ai/v1/teams/${process.env.DOCSBOT_TEAM_ID}/bots/${cleanBotId}/sources/upload`;
+    const sourceUrl = `https://api.docsbot.ai/v1/teams/${process.env.DOCSBOT_TEAM_ID}/bots/${botId}/sources/upload`;
     const response = await fetch(sourceUrl, {
       method: 'POST',
       headers: {
