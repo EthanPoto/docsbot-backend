@@ -9,7 +9,7 @@ const PDFDocument = require('pdfkit');
 const cron = require('node-cron');
 const { DateTime } = require('luxon');
 const cors = require('cors');
-const fetch = require('node-fetch');
+
 
 // DocsBot + Desktop mirror config
 const DOCSBOT_API_KEY = (process.env.DOCSBOT_API_KEY || '').trim();
@@ -20,8 +20,6 @@ const DOCSBOT_MAP = {
 const DESKTOP_PATH = "/Users/ethanpoto/Desktop/docsbot-backend"; // desktop mirror root
 
 // --- DOCSBOT AUTO-UPLOAD HELPER ---
-const fetch = require('node-fetch');
-
 async function uploadToDocsBot(slug, pdfPath) {
   try {
     // Map each company slug to its DocsBot bot ID
