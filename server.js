@@ -742,6 +742,19 @@ writeTodayPdf(slug, []);
 });
 })();
 
+// --- Ensure initial PDFs exist on boot ---
+(function ensureInitialPdfs() {
+  const slugs = ['1stanswerbot', 'serverpartners'];
+  slugs.forEach(slug => {
+    const { storePath, todayPdf } = slugDirs(slug);
+    const store = loadStore(storePath);
+    if (!fs.existsSync(todayPdf)) {
+      writeTodayPdf(todayPdf, slug, store.items || []);
+      console.log(`✅ Bootstrapped initial PDF for: ${slug}`);
+    }
+  });
+})();
+
 // ------------ START ------------
 app.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
