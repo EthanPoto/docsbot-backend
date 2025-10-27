@@ -17,6 +17,7 @@ const DOCSBOT_MAP = {
   "1stanswerbot": "Tuy1mgF9xidg0KhsHmMr/eF9K4VnlybhOGpIqz0iH",
   "serverpartners": "Tuy1mgF9xidg0KhsHmMr/CHJTUkAyMBecrlVp51Zq"
 };
+
 const DESKTOP_PATH = "/Users/ethanpoto/Desktop/docsbot-backend"; // desktop mirror root
 
 // --- DOCSBOT AUTO-UPLOAD HELPER ---
@@ -24,9 +25,9 @@ async function uploadToDocsBot(slug, pdfPath) {
   try {
     // Map each company slug to its DocsBot bot ID
     const botMap = {
-  '1stanswerbot': 'eF9K4VnlybhOGpIqz0iH',
-  'serverpartners': 'CHJTUkAyMBecrlVp51Zq'
-};
+      '1stanswerbot': 'eF9K4VnlybhOGpIqz0iH',
+      'serverpartners': 'CHJTUkAyMBecrlVp51Zq'
+    };
 
     const botId = botMap[slug];
     if (!botId) {
@@ -34,37 +35,38 @@ async function uploadToDocsBot(slug, pdfPath) {
       return;
     }
 
-    // STEP 1: Request a signed upload URL from DocsBot's Sources Admin API
-    const sourceUrl = `https://api.docsbot.ai/v1/teams/${process.env.DOCSBOT_TEAM_ID}/bots/${botId}/sources/upload`;
+    const teamId = process.env.DOCSBOT_TEAM_ID;
+    const apiKey = process.env.DOCSBOT_API_KEY;
+
+    // STEP 1: Request a signed upload URL from DocsBot
+    const sourceUrl = `https://api.docsbot.ai/v1/teams/${teamId}/bots/${botId}/sources/upload`;
+
+    console.log('📡 Requesting DocsBot signed URL for', slug, '→', sourceUrl);
+
     const response = await fetch(sourceUrl, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${process.env.DOCSBOT_API_KEY}`,
-        'Content-Type': 'application/json'
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
       },
       body: JSON.stringify({
         filename: path.basename(pdfPath),
-        mimetype: 'application/pdf'
-      })
+        source_type: 'file', // required by DocsBot
+      }),
     });
 
-    if (!response.ok) {
-      console.error(`Failed to get signed URL for ${slug}:`, await response.text());
+    const data = await response.json();
+    if (!response.ok || !data.upload_url) {
+      console.error(`Failed to get signed URL for ${slug}:`, data);
       return;
     }
 
-    const { upload_url } = await response.json();
-    if (!upload_url) {
-      console.error(`DocsBot did not return an upload_url for ${slug}`);
-      return;
-    }
-
-    // STEP 2: Upload the file directly to the signed URL
+    // STEP 2: Upload the PDF to the signed Google Storage URL
     const fileBuffer = fs.readFileSync(pdfPath);
-    const uploadResp = await fetch(upload_url, {
+    const uploadResp = await fetch(data.upload_url, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/octet-stream' },
-      body: fileBuffer
+      body: fileBuffer,
     });
 
     if (!uploadResp.ok) {
@@ -77,8 +79,6 @@ async function uploadToDocsBot(slug, pdfPath) {
     console.error(`Error uploading to DocsBot for ${slug}:`, err);
   }
 }
-
-
 
     // ------------ CONFIG ------------
 const PORT = process.env.PORT || 3000;
