@@ -1,0 +1,18 @@
+{
+  "items": [
+    {
+      "q": "(unspecified question)",
+      "a": "We provide cloud hosting and server management.",
+      "status": "answered",
+      "ts": 1762067982991,
+      "source": "email"
+    },
+    {
+      "q": "(unspecified question)",
+      "a": "We provide cloud hosting and server management.",
+      "status": "answered",
+      "ts": 1762068636122,
+      "source": "email"
+    }
+  ]
+}
