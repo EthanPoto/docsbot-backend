@@ -58,15 +58,24 @@ async function uploadToDocsBot(slug, pdfPath) {
 
     // --- STEP 2: Upload the PDF to DocsBot's GCS bucket ---
     console.log(`⬆️  Uploading PDF to DocsBot cloud for ${slug}...`);
-    const uploadResp = await fetch(data.url, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/pdf' },
-      body: fs.readFileSync(pdfPath),
-    });
-    if (!uploadResp.ok) {
-      console.error(`❌ Upload to DocsBot failed for ${slug}:`, await uploadResp.text());
-      return;
-    }
+    console.log(`⬆️  Uploading PDF to DocsBot cloud for ${slug}...`);
+const fileBuffer = fs.readFileSync(pdfPath);
+const uploadResp = await fetch(data.url, {
+  method: 'PUT',
+  headers: {
+    // Must exactly match signed headers expected by DocsBot
+    'Content-Type': 'application/pdf',
+  },
+  // Prevent automatic compression / chunked encoding
+  body: fileBuffer,
+});
+const text = await uploadResp.text();
+if (!uploadResp.ok) {
+  console.error(`❌ Upload to DocsBot failed for ${slug}:`, text);
+  return;
+}
+console.log(`✅ Upload successful to DocsBot storage for ${slug}`);
+
 
     // Wait briefly to ensure DocsBot sees the file
     await new Promise(r => setTimeout(r, 2000));
