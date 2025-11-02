@@ -74,6 +74,9 @@ async function uploadToDocsBot(slug, pdfPath) {
       return;
     }
 
+// Give GCS a moment to make the file visible before DocsBot indexes it
+await new Promise(r => setTimeout(r, 2000));
+
     console.log(`✅ DocsBot updated successfully for ${slug}: ${path.basename(pdfPath)}`);
   } catch (err) {
     console.error(`Error uploading to DocsBot for ${slug}:`, err);
