@@ -140,7 +140,10 @@ function slugDirs(slug) {
   const publicSlug = path.join(PUBLIC_DIR, safe);
   const publicArchive = path.join(publicSlug, 'archive');
 
-  const storePath = path.join(base, 'qa_store.json');
+  const storeDir = path.join(DATA_DIR, slug);
+fs.mkdirSync(storeDir, { recursive: true });
+const storePath = path.join(storeDir, "qa_store.json");
+
   const todayPdf = path.join(publicSlug, 'qa-today.pdf');
 
   // ensure dirs
