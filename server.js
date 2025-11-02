@@ -132,21 +132,17 @@ const upload = multer({ limits: { fieldSize: 1 * 1024 * 1024 } });
 function slugDirs(slug) {
   const safe = String(slug || 'default').toLowerCase().replace(/[^a-z0-9-_]/g, '');
 
-  // DATA side
+  // --- DATA side ---
   const base = path.join(DATA_DIR, safe);
   const archive = path.join(base, 'archive');
+  const storePath = path.join(base, 'qa_store.json');
 
-  // PUBLIC side
+  // --- PUBLIC side ---
   const publicSlug = path.join(PUBLIC_DIR, safe);
   const publicArchive = path.join(publicSlug, 'archive');
-
-  const storeDir = path.join(DATA_DIR, slug);
-fs.mkdirSync(storeDir, { recursive: true });
-const storePath = path.join(storeDir, "qa_store.json");
-
   const todayPdf = path.join(publicSlug, 'qa-today.pdf');
 
-  // ensure dirs
+  // --- Ensure directories exist ---
   [base, archive, publicSlug, publicArchive].forEach(p => {
     if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
   });
@@ -155,8 +151,13 @@ const storePath = path.join(storeDir, "qa_store.json");
 }
 
 function loadStore(p) {
-  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return { items: [] }; }
+  try {
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch {
+    return { items: [] };
+  }
 }
+
 function saveStore(p, json) {
   fs.writeFileSync(p, JSON.stringify(json, null, 2));
 }
