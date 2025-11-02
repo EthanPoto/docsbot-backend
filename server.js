@@ -639,7 +639,8 @@ app.post('/inbound', upload.any(), (req, res) => {
     }
 
     saveStore(storePath, store);
-    writeTodayPdf(slug, store.items);
+    writeTodayPdf(path.join(PUBLIC_DIR, slug, 'qa-today.pdf'), slug, store.items);
+
     uploadToDocsBot(slug, path.join(PUBLIC_DIR, slug, 'qa-today.pdf'));
 
 
