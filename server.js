@@ -38,50 +38,69 @@ async function uploadToDocsBot(slug, pdfPath) {
     const teamId = process.env.DOCSBOT_TEAM_ID;
     const apiKey = process.env.DOCSBOT_API_KEY;
 
-    // STEP 1: Request a signed upload URL from DocsBot
-    const sourceUrl = `https://docsbot.ai/api/teams/${process.env.DOCSBOT_TEAM_ID}/bots/${botId}/sources/upload`;
+    // --- STEP 1: Request presigned upload URL ---
+    const sourceUrl = `https://docsbot.ai/api/teams/${teamId}/bots/${botId}/upload-url?fileName=${encodeURIComponent(path.basename(pdfPath))}`;
 
     console.log('📡 Requesting DocsBot signed URL for', slug, '→', sourceUrl);
 
     const response = await fetch(sourceUrl, {
-      method: 'POST',
+      method: 'GET',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        filename: path.basename(pdfPath),
-        source_type: 'file', // required by DocsBot
-      }),
     });
 
     const data = await response.json();
-    if (!response.ok || !data.upload_url) {
-      console.error(`Failed to get signed URL for ${slug}:`, data);
+    if (!response.ok || !data.url) {
+      console.error(`❌ Failed to get signed URL for ${slug}:`, data);
       return;
     }
 
-    // STEP 2: Upload the PDF to the signed Google Storage URL
-    const fileBuffer = fs.readFileSync(pdfPath);
-    const uploadResp = await fetch(data.upload_url, {
+    // --- STEP 2: Upload the PDF to DocsBot's GCS bucket ---
+    console.log(`⬆️  Uploading PDF to DocsBot cloud for ${slug}...`);
+    const uploadResp = await fetch(data.url, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/octet-stream' },
-      body: fileBuffer,
+      headers: { 'Content-Type': 'application/pdf' },
+      body: fs.readFileSync(pdfPath),
     });
-
     if (!uploadResp.ok) {
-      console.error(`Upload to DocsBot failed for ${slug}:`, await uploadResp.text());
+      console.error(`❌ Upload to DocsBot failed for ${slug}:`, await uploadResp.text());
       return;
     }
 
-// Give GCS a moment to make the file visible before DocsBot indexes it
-await new Promise(r => setTimeout(r, 2000));
+    // Wait briefly to ensure DocsBot sees the file
+    await new Promise(r => setTimeout(r, 2000));
 
-    console.log(`✅ DocsBot updated successfully for ${slug}: ${path.basename(pdfPath)}`);
+    // --- STEP 3: Create or refresh the DocsBot source ---
+    console.log(`🧠 Creating DocsBot source for ${slug}...`);
+    const createRes = await fetch(
+      `https://docsbot.ai/api/teams/${teamId}/bots/${botId}/sources`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          type: 'document',
+          title: path.basename(pdfPath),
+          file: data.file,
+        }),
+      }
+    );
+
+    const createJson = await createRes.json();
+    if (!createRes.ok) {
+      console.error(`❌ DocsBot source creation failed for ${slug}:`, createJson);
+      return;
+    }
+
+    console.log(`✅ DocsBot updated successfully for ${slug}:`, createJson.id || createJson);
   } catch (err) {
     console.error(`Error uploading to DocsBot for ${slug}:`, err);
   }
 }
+
 
     // ------------ CONFIG ------------
 const PORT = process.env.PORT || 3000;
