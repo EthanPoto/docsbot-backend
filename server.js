@@ -20,7 +20,7 @@ const DOCSBOT_MAP = {
 
 const DESKTOP_PATH = "/Users/ethanpoto/Desktop/docsbot-backend"; // desktop mirror root
 
-// --- DOCSBOT AUTO-UPLOAD HELPER ---
+// --- DOCSBOT AUTO-UPLOAD HELPER (with safe replace) ---
 async function uploadToDocsBot(slug, pdfPath) {
   try {
     const botMap = {
@@ -33,12 +33,33 @@ async function uploadToDocsBot(slug, pdfPath) {
       return;
     }
 
-    const teamId = process.env.DOCSBOT_TEAM_ID;         // Tuy1mgF9xidg0KhsHmMr
-    const apiKey = process.env.DOCSBOT_API_KEY;         // same key you see in the UI
-    const fileName = require('path').basename(pdfPath);
-    const fileBuf = require('fs').readFileSync(pdfPath);
+    const teamId = process.env.DOCSBOT_TEAM_ID;
+    const apiKey = process.env.DOCSBOT_API_KEY;
+    const fileName = path.basename(pdfPath);
+    const fileBuf = fs.readFileSync(pdfPath);
 
-    // STEP 1: presigned URL
+    // STEP 0: check for existing sources with same title
+    console.log(`🔍 Checking existing DocsBot sources for ${slug}...`);
+    try {
+      const listRes = await fetch(`https://docsbot.ai/api/teams/${teamId}/bots/${botId}/sources`, {
+        headers: { Authorization: `Bearer ${apiKey}` }
+      });
+      const listJson = await listRes.json();
+      if (listJson?.sources?.length) {
+        const existing = listJson.sources.find(s => s.title === fileName);
+        if (existing) {
+          console.log(`🗑️  Removing old DocsBot source ${existing.id} (${fileName})`);
+          await fetch(`https://docsbot.ai/api/teams/${teamId}/bots/${botId}/sources/${existing.id}`, {
+            method: 'DELETE',
+            headers: { Authorization: `Bearer ${apiKey}` }
+          });
+        }
+      }
+    } catch (e) {
+      console.warn('⚠️  Could not fetch/delete old source, continuing normally:', e.message);
+    }
+
+    // STEP 1: get presigned upload URL
     const signUrl = `https://docsbot.ai/api/teams/${teamId}/bots/${botId}/upload-url?fileName=${encodeURIComponent(fileName)}`;
     console.log('📡 Requesting DocsBot signed URL:', signUrl);
     const pres = await fetch(signUrl, { headers: { Authorization: `Bearer ${apiKey}` }});
@@ -48,7 +69,7 @@ async function uploadToDocsBot(slug, pdfPath) {
       return;
     }
 
-    // STEP 2: upload to GCS (must match signed headers)
+    // STEP 2: upload to cloud
     console.log('⬆️  Uploading to DocsBot cloud…');
     const upResp = await fetch(presJson.url, {
       method: 'PUT',
@@ -60,8 +81,8 @@ async function uploadToDocsBot(slug, pdfPath) {
       return;
     }
 
-    // STEP 3: create/update the source
-    console.log('🧩 Creating/updating source in DocsBot…');
+    // STEP 3: create the new source
+    console.log('🧩 Creating source in DocsBot…');
     const srcResp = await fetch(`https://docsbot.ai/api/teams/${teamId}/bots/${botId}/sources`, {
       method: 'POST',
       headers: {
@@ -71,8 +92,7 @@ async function uploadToDocsBot(slug, pdfPath) {
       body: JSON.stringify({
         type: 'document',
         title: fileName,
-        file: presJson.file, // <- use the cloud path returned in STEP 1
-        // optional: scheduleInterval: 'daily',
+        file: presJson.file,
       }),
     });
     const srcJson = await srcResp.json();
