@@ -23,59 +23,69 @@ const DESKTOP_PATH = "/Users/ethanpoto/Desktop/docsbot-backend"; // desktop mirr
 // --- DOCSBOT AUTO-UPLOAD HELPER ---
 async function uploadToDocsBot(slug, pdfPath) {
   try {
-    // Map each company slug to its DocsBot bot ID
     const botMap = {
       '1stanswerbot': 'eF9K4VnlybhOGpIqz0iH',
       'serverpartners': 'CHJTUkAyMBecrlVp51Zq'
     };
-
     const botId = botMap[slug];
     if (!botId) {
-      console.warn(`No DocsBot ID found for slug "${slug}", skipping upload.`);
+      console.warn(`No DocsBot ID for slug "${slug}", skipping upload.`);
       return;
     }
 
-    const teamId = process.env.DOCSBOT_TEAM_ID;
-    const apiKey = process.env.DOCSBOT_API_KEY;
+    const teamId = process.env.DOCSBOT_TEAM_ID;         // Tuy1mgF9xidg0KhsHmMr
+    const apiKey = process.env.DOCSBOT_API_KEY;         // same key you see in the UI
+    const fileName = require('path').basename(pdfPath);
+    const fileBuf = require('fs').readFileSync(pdfPath);
 
-    // --- STEP 1: Request presigned upload URL ---
-    const sourceUrl = `https://docsbot.ai/api/teams/${teamId}/bots/${botId}/upload-url?fileName=${encodeURIComponent(path.basename(pdfPath))}`;
+    // STEP 1: presigned URL
+    const signUrl = `https://docsbot.ai/api/teams/${teamId}/bots/${botId}/upload-url?fileName=${encodeURIComponent(fileName)}`;
+    console.log('📡 Requesting DocsBot signed URL:', signUrl);
+    const pres = await fetch(signUrl, { headers: { Authorization: `Bearer ${apiKey}` }});
+    const presJson = await pres.json();
+    if (!pres.ok || !presJson.url || !presJson.file) {
+      console.error('Failed to get signed URL:', presJson);
+      return;
+    }
 
-    console.log('📡 Requesting DocsBot signed URL for', slug, '→', sourceUrl);
-
-    const response = await fetch(sourceUrl, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-      },
+    // STEP 2: upload to GCS (must match signed headers)
+    console.log('⬆️  Uploading to DocsBot cloud…');
+    const upResp = await fetch(presJson.url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: fileBuf,
     });
-
-    const data = await response.json();
-    if (!response.ok || !data.url) {
-      console.error(`❌ Failed to get signed URL for ${slug}:`, data);
+    if (!upResp.ok) {
+      console.error('Upload failed:', await upResp.text());
       return;
     }
 
-    // --- STEP 2: Upload the PDF to DocsBot's GCS bucket ---
-    console.log(`⬆️  Uploading PDF to DocsBot cloud for ${slug}...`);
-    console.log(`⬆️  Uploading PDF to DocsBot cloud for ${slug}...`);
-const fileBuffer = fs.readFileSync(pdfPath);
-const uploadResp = await fetch(data.url, {
-  method: 'PUT',
-  headers: {
-    // Must exactly match signed headers expected by DocsBot
-    'Content-Type': 'application/pdf',
-  },
-  // Prevent automatic compression / chunked encoding
-  body: fileBuffer,
-});
-const text = await uploadResp.text();
-if (!uploadResp.ok) {
-  console.error(`❌ Upload to DocsBot failed for ${slug}:`, text);
-  return;
-}
-console.log(`✅ Upload successful to DocsBot storage for ${slug}`);
+    // STEP 3: create/update the source
+    console.log('🧩 Creating/updating source in DocsBot…');
+    const srcResp = await fetch(`https://docsbot.ai/api/teams/${teamId}/bots/${botId}/sources`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        type: 'document',
+        title: fileName,
+        file: presJson.file, // <- use the cloud path returned in STEP 1
+        // optional: scheduleInterval: 'daily',
+      }),
+    });
+    const srcJson = await srcResp.json();
+    if (!srcResp.ok) {
+      console.error('Create source failed:', srcJson);
+      return;
+    }
 
+    console.log(`✅ DocsBot updated: ${slug} → source ${srcJson.id}`);
+  } catch (err) {
+    console.error('DocsBot upload error:', err);
+  }
+}
 
     // Wait briefly to ensure DocsBot sees the file
     await new Promise(r => setTimeout(r, 2000));
