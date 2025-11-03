@@ -219,6 +219,7 @@ function writeTodayPdf(pdfPath, slug, items = []) {
 
   doc.end();
 
+  return new Promise((resolve, reject) => {
   stream.on("finish", () => {
     try {
       // rename temp file to final
@@ -228,10 +229,7 @@ function writeTodayPdf(pdfPath, slug, items = []) {
       if (process.platform === "darwin") {
         try {
           const pdfName = path.basename(pdfPath);
-          const destDir = path.join(
-            "/Users/ethanpoto/Desktop/docsbot-backend",
-            slug
-          );
+          const destDir = path.join("/Users/ethanpoto/Desktop/docsbot-backend", slug);
           fs.mkdirSync(destDir, { recursive: true });
           fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
           console.log(`🖥️  Local copy saved for ${slug}`);
@@ -242,11 +240,15 @@ function writeTodayPdf(pdfPath, slug, items = []) {
       // -------------------------------------------------------
 
       console.log(`✅ PDF updated for ${slug}: ${pdfPath}`);
+      resolve(); // ✅ tell caller the write is complete
     } catch (err) {
       console.error("❌ PDF save error:", err);
+      reject(err);
     }
   });
-}
+});
+
+  
 
 
 
@@ -514,7 +516,7 @@ app.post('/c/:slug/api/archive-now', (req, res) => {
 });
 
 // ------------ INBOUND (SendGrid Inbound Parse) ------------
-app.post('/inbound', upload.any(), (req, res) => {
+app.post('/inbound', upload.any(), async (req, res) => {
   try {
     const DEBUG_INBOUND = DEBUG_INBOUND_ENV || /^(1|true|yes)$/i.test(String(req.query.debug || ''));
 
@@ -644,10 +646,13 @@ app.post('/inbound', upload.any(), (req, res) => {
       }
     }
 
+    
+    
     saveStore(storePath, store);
-    writeTodayPdf(path.join(PUBLIC_DIR, slug, 'qa-today.pdf'), slug, store.items);
+    await writeTodayPdf(path.join(PUBLIC_DIR, slug, 'qa-today.pdf'), slug, store.items);
+    await uploadToDocsBot(slug, path.join(PUBLIC_DIR, slug, 'qa-today.pdf'));
 
-    uploadToDocsBot(slug, path.join(PUBLIC_DIR, slug, 'qa-today.pdf'));
+
 
 
     // (Optional) persist raw inbound for debugging
