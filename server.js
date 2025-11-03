@@ -87,9 +87,7 @@ async function uploadToDocsBot(slug, pdfPath) {
   }
 }
 
-    // Wait briefly to ensure DocsBot sees the file
-    await new Promise(r => setTimeout(r, 2000));
-
+    
     // --- STEP 3: Create or refresh the DocsBot source ---
     console.log(`🧠 Creating DocsBot source for ${slug}...`);
     const createRes = await fetch(
