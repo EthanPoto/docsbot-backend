@@ -219,40 +219,38 @@ function writeTodayPdf(pdfPath, slug, items = []) {
 
   doc.end();
 
-  return new Promise((resolve, reject) => {
-  stream.on("finish", () => {
-    try {
-      // rename temp file to final
-      fs.renameSync(tmp, pdfPath);
+    return new Promise((resolve, reject) => {
+    stream.on("finish", () => {
+      try {
+        // rename temp file to final
+        fs.mkdirSync(path.dirname(pdfPath), { recursive: true });
+        fs.renameSync(tmp, pdfPath);
 
-      // ---------- MIRROR LOCALLY ONLY WHEN ON MAC ----------
-      if (process.platform === "darwin") {
-        try {
-          const pdfName = path.basename(pdfPath);
-          const destDir = path.join("/Users/ethanpoto/Desktop/docsbot-backend", slug);
-          fs.mkdirSync(destDir, { recursive: true });
-          fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
-          console.log(`🖥️  Local copy saved for ${slug}`);
-        } catch (mirrorErr) {
-          console.warn("⚠️  Desktop mirror skipped:", mirrorErr.message);
+        if (process.platform === "darwin") {
+          try {
+            const pdfName = path.basename(pdfPath);
+            const destDir = path.join("/Users/ethanpoto/Desktop/docsbot-backend", slug);
+            fs.mkdirSync(destDir, { recursive: true });
+            fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
+            console.log(`🖥️  Local copy saved for ${slug}`);
+          } catch (mirrorErr) {
+            console.warn("⚠️  Desktop mirror skipped:", mirrorErr.message);
+          }
         }
-      }
-      // -------------------------------------------------------
 
-      console.log(`✅ PDF updated for ${slug}: ${pdfPath}`);
-      resolve(); // ✅ tell caller the write is complete
-    } catch (err) {
-      console.error("❌ PDF save error:", err);
-      reject(err);
-    }
+        console.log(`✅ PDF updated for ${slug}: ${pdfPath}`);
+        resolve();
+      } catch (err) {
+        console.error("❌ PDF save error:", err);
+        reject(err);
+      }
+    });
   });
-});
+} 
+
 
   
-
-
-
-// Robust text extraction from HTML (if only HTML is provided)
+  // Robust text extraction from HTML (if only HTML is provided)
 function htmlToText(html) {
   if (!html) return '';
   let out = String(html);
