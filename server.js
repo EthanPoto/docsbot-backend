@@ -88,37 +88,6 @@ async function uploadToDocsBot(slug, pdfPath) {
 }
 
     
-    // --- STEP 3: Create or refresh the DocsBot source ---
-    console.log(`🧠 Creating DocsBot source for ${slug}...`);
-    const createRes = await fetch(
-      `https://docsbot.ai/api/teams/${teamId}/bots/${botId}/sources`,
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          type: 'document',
-          title: path.basename(pdfPath),
-          file: data.file,
-        }),
-      }
-    );
-
-    const createJson = await createRes.json();
-    if (!createRes.ok) {
-      console.error(`❌ DocsBot source creation failed for ${slug}:`, createJson);
-      return;
-    }
-
-    console.log(`✅ DocsBot updated successfully for ${slug}:`, createJson.id || createJson);
-  } catch (err) {
-    console.error(`Error uploading to DocsBot for ${slug}:`, err);
-  }
-}
-
-
     // ------------ CONFIG ------------
 const PORT = process.env.PORT || 3000;
 const TIMEZONE = process.env.TIMEZONE || 'America/Indiana/Indianapolis';
@@ -448,7 +417,7 @@ app.get('/c/:slug/api/status', (req, res) => {
   if (!raw) return res.status(400).json({ error: 'missing slug' });
   const { storePath, slug } = slugDirs(raw);
   const store = loadStore(storePath);
-  const todayPdfUrl = `${BASE_URL}/public/${encodeURIComponent(slug)}/escalation-qa.pdf`;
+  const todayPdfUrl = `${BASE_URL}/public/${encodeURIComponent(slug)}/qa-today.pdf`;
 
   res.json({ slug, count: store.items.length, todayPdfUrl });
 });
@@ -518,11 +487,11 @@ app.post('/c/:slug/api/archive-now', (req, res) => {
   // Ensure today's PDF reflects current store
     // Ensure escalation PDF reflects current store
   const store = loadStore(storePath);
-  writeTodayPdf(slug, store.items || []);
+  writeTodayPdf(todayPdf, slug, store.items || []);
 
   // Copy to both private and public archives (from escalation-qa.pdf)
   const filename = `${day}-${slug}.pdf`;
-  const srcPdf = path.join(PUBLIC_DIR, slug, 'escalation-qa.pdf');
+  const srcPdf = todayPdf;
   const outPrivate = path.join(archive, filename);
   const outPublic  = path.join(publicArchive, filename);
   try { fs.copyFileSync(srcPdf, outPrivate); } catch (e) {
@@ -534,7 +503,8 @@ app.post('/c/:slug/api/archive-now', (req, res) => {
 
   // Reset store and rewrite an empty escalation file
   saveStore(storePath, { items: [] });
-  writeTodayPdf(slug, []);
+  writeTodayPdf(todayPdf, slug, store.items || []);
+
   return res.json({ 
     ok: true, 
     slug, 
@@ -724,7 +694,9 @@ writeTodayPdf(slug, store.items || []);
 
 // Copy escalation file to both private and public archives with date-first filename
 const filename = `${day}-${slug}.pdf`;
-const srcPdf = path.join(PUBLIC_DIR, slug, 'escalation-qa.pdf');
+const srcPdf = todayPdf;
+
+
 try {
   fs.copyFileSync(srcPdf, path.join(archive, filename));
 } catch (e) {
@@ -739,7 +711,8 @@ console.log('Archived PDF', { slug, private: path.join(archive, filename), publi
 
 // reset store and rewrite an empty escalation file
 saveStore(storePath, { items: [] });
-writeTodayPdf(slug, []);
+writeTodayPdf(todayPdf, slug, []);
+
 
 
       // purge old archives (private + public)
@@ -760,7 +733,8 @@ writeTodayPdf(slug, []);
       try {
         const filesPub = fs.readdirSync(publicArchive);
         filesPub.forEach(f => {
-          if (!/^\d{4}-\d{2}-\d2-[a-z0-9-_]+\.pdf$/i.test(f)) return;
+          if (!/^\d{4}-\d{2}-\d{2}-[a-z0-9-_]+\.pdf$/i.test(f)) return;
+
           const d = f.slice(0, 10);
           const dt = DateTime.fromFormat(d, 'yyyy-LL-dd');
           if (dt.isValid && dt < cutoff) {
@@ -782,7 +756,8 @@ writeTodayPdf(slug, []);
   listSlugs().forEach(slug => {
   const { storePath } = slugDirs(slug);
   const store = loadStore(storePath);
-  writeTodayPdf(slug, store.items || []);
+  writeTodayPdf(todayPdf, slug, store.items || []);
+
 });
 })();
 
@@ -802,8 +777,9 @@ writeTodayPdf(slug, []);
 // ------------ START ------------
 app.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
-  console.log(`Health: /health  Status: /api/status  Company status: /c/:slug/api/status  Peek: /c/:slug/api/peek  Archives: /c/:slug/api/archives  Download: /c/:slug/archive/:file  PDFs under /public/:slug/escalation-qa.pdf`);
+  console.log(`Health: /health  Status: /api/status  Company status: /c/:slug/api/status  Peek: /c/:slug/api/peek  Archives: /c/:slug/api/archives  Download: /c/:slug/archive/:file  PDFs under /public/:slug/qa-today.pdf`);
 });
+
 
 
 // Graceful-ish error logs
