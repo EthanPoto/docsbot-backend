@@ -754,12 +754,12 @@ writeTodayPdf(todayPdf, slug, []);
 (function ensureBootPdfs() {
   // Create an empty "today" PDF for any existing slugs on boot
   listSlugs().forEach(slug => {
-  const { storePath } = slugDirs(slug);
-  const store = loadStore(storePath);
-  writeTodayPdf(todayPdf, slug, store.items || []);
-
-});
+    const { storePath, todayPdf } = slugDirs(slug);
+    const store = loadStore(storePath);
+    writeTodayPdf(todayPdf, slug, store.items || []);
+  });
 })();
+
 
 // --- Ensure initial PDFs exist on boot ---
 (function ensureInitialPdfs() {
