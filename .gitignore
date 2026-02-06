@@ -1,1 +1,9 @@
 node_modules
+
+.DS_Store
+data/.DS_Store
+public/**/qa-today.pdf
+public/archive/qa-today.pdf
+node
+node_modules/
+docsbot-backend@1.0.0
