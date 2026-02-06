@@ -1,14 +1,4 @@
-// server.js — 1st Answer Bot inbound Q/A store (multi-tenant) + per-tenant PDFs
-// Goals:
-// - Route updates by qa+<slug>@replies.<domain> in To/CC, with subject fallback: [1st Answer Bot][slug] ...
-// - Save Q/A pairs per slug
-// - Rebuild a single rolling PDF per slug: /public/<slug>/qa-today.pdf
-// - Optional private daily archives under /data/<slug>/archive
-// - Keep behavior stable even when reps forget "Q:" or users edit drafts
-// - Keep PDFs clean by stripping signatures + quoted email thread content
-
-'use strict';
-
+// server.js — Multi-tenant Q/A store with per-company PDFs + SendGrid inbound
 console.log('BOOT', { cwd: process.cwd(), node: process.version });
 
 const express = require('express');
@@ -19,13 +9,110 @@ const PDFDocument = require('pdfkit');
 const cron = require('node-cron');
 const { DateTime } = require('luxon');
 const cors = require('cors');
-const crypto = require('crypto');
 
-// ---------------- CONFIG ----------------
+
+// DocsBot + Desktop mirror config
+const DOCSBOT_API_KEY = (process.env.DOCSBOT_API_KEY || '').trim();
+const DOCSBOT_MAP = {
+  "1stanswerbot": "Tuy1mgF9xidg0KhsHmMr/eF9K4VnlybhOGpIqz0iH",
+  "serverpartners": "Tuy1mgF9xidg0KhsHmMr/CHJTUkAyMBecrlVp51Zq"
+};
+
+const DESKTOP_PATH = "/Users/ethanpoto/Desktop/docsbot-backend"; // desktop mirror root
+
+// --- DOCSBOT AUTO-UPLOAD HELPER (with safe replace) ---
+async function uploadToDocsBot(slug, pdfPath) {
+  try {
+    const botMap = {
+      '1stanswerbot': 'eF9K4VnlybhOGpIqz0iH',
+      'serverpartners': 'CHJTUkAyMBecrlVp51Zq'
+    };
+    const botId = botMap[slug];
+    if (!botId) {
+      console.warn(`No DocsBot ID for slug "${slug}", skipping upload.`);
+      return;
+    }
+
+    const teamId = process.env.DOCSBOT_TEAM_ID;
+    const apiKey = process.env.DOCSBOT_API_KEY;
+    const fileName = path.basename(pdfPath);
+    const fileBuf = fs.readFileSync(pdfPath);
+
+    // STEP 0: check for existing sources with same title
+    console.log(`🔍 Checking existing DocsBot sources for ${slug}...`);
+    try {
+      const listRes = await fetch(`https://docsbot.ai/api/teams/${teamId}/bots/${botId}/sources`, {
+        headers: { Authorization: `Bearer ${apiKey}` }
+      });
+      const listJson = await listRes.json();
+      if (listJson?.sources?.length) {
+        const existing = listJson.sources.find(s => s.title === fileName);
+        if (existing) {
+          console.log(`🗑️  Removing old DocsBot source ${existing.id} (${fileName})`);
+          await fetch(`https://docsbot.ai/api/teams/${teamId}/bots/${botId}/sources/${existing.id}`, {
+            method: 'DELETE',
+            headers: { Authorization: `Bearer ${apiKey}` }
+          });
+        }
+      }
+    } catch (e) {
+      console.warn('⚠️  Could not fetch/delete old source, continuing normally:', e.message);
+    }
+
+    // STEP 1: get presigned upload URL
+    const signUrl = `https://docsbot.ai/api/teams/${teamId}/bots/${botId}/upload-url?fileName=${encodeURIComponent(fileName)}`;
+    console.log('📡 Requesting DocsBot signed URL:', signUrl);
+    const pres = await fetch(signUrl, { headers: { Authorization: `Bearer ${apiKey}` }});
+    const presJson = await pres.json();
+    if (!pres.ok || !presJson.url || !presJson.file) {
+      console.error('Failed to get signed URL:', presJson);
+      return;
+    }
+
+    // STEP 2: upload to cloud
+    console.log('⬆️  Uploading to DocsBot cloud…');
+    const upResp = await fetch(presJson.url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: fileBuf,
+    });
+    if (!upResp.ok) {
+      console.error('Upload failed:', await upResp.text());
+      return;
+    }
+
+    // STEP 3: create the new source
+    console.log('🧩 Creating source in DocsBot…');
+    const srcResp = await fetch(`https://docsbot.ai/api/teams/${teamId}/bots/${botId}/sources`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        type: 'document',
+        title: fileName,
+        file: presJson.file,
+      }),
+    });
+    const srcJson = await srcResp.json();
+    if (!srcResp.ok) {
+      console.error('Create source failed:', srcJson);
+      return;
+    }
+
+    console.log(`✅ DocsBot updated: ${slug} → source ${srcJson.id}`);
+  } catch (err) {
+    console.error('DocsBot upload error:', err);
+  }
+}
+
+    
+    // ------------ CONFIG ------------
 const PORT = process.env.PORT || 3000;
 const TIMEZONE = process.env.TIMEZONE || 'America/Indiana/Indianapolis';
-const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
-const PUBLIC_DIR = process.env.PUBLIC_DIR || path.join(process.cwd(), 'public');
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');        // persistent disk mount
+const PUBLIC_DIR = process.env.PUBLIC_DIR || path.join(process.cwd(), 'public');  // static pdfs
 const BASE_URL =
   process.env.BASE_URL ||
   process.env.RENDER_EXTERNAL_URL ||
@@ -33,40 +120,29 @@ const BASE_URL =
 
 const INBOUND_SECRET = process.env.INBOUND_SECRET || ''; // header x-inbound-secret OR ?secret=...
 const ADMIN_SECRET = process.env.ADMIN_SECRET || '';     // for admin-only endpoints
-
 const DEBUG_INBOUND_ENV = /^(1|true|yes)$/i.test(String(process.env.DEBUG_INBOUND || ''));
+const ARCHIVE_RETENTION_DAYS = parseInt(process.env.ARCHIVE_RETENTION_DAYS || '60', 10);
+
+// best-effort build id for /health
 const BUILD = process.env.RENDER_GIT_COMMIT || process.env.BUILD || 'dev';
 
-const ARCHIVE_RETENTION_DAYS = parseInt(process.env.ARCHIVE_RETENTION_DAYS || '90', 10);
-
-// Keep only qa-today.pdf public. Daily public archives disabled by default.
-const ENABLE_PUBLIC_ARCHIVES = /^(1|true|yes)$/i.test(String(process.env.ENABLE_PUBLIC_ARCHIVES || ''));
-
-// Hard cap on private archives per tenant (newest kept). 0 disables.
-const ARCHIVE_CAP = parseInt(process.env.ARCHIVE_CAP || '120', 10);
-
-// Treat repeated SendGrid posts as idempotent based on computed inbound signature.
-const ENABLE_IDEMPOTENCY = !/^(0|false|no)$/i.test(String(process.env.ENABLE_IDEMPOTENCY || '1'));
-
-// Store-level dedupe for repeated questions.
-const ENABLE_DEDUPE = !/^(0|false|no)$/i.test(String(process.env.ENABLE_DEDUPE || '1'));
-
-// ---------------- BOOTSTRAP DIRS ----------------
+// ensure root dirs
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 
-// ---------------- APP ----------------
 const app = express();
-app.use(cors({ origin: true, credentials: false }));
-app.use(express.json({ limit: '2mb' }));
-app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
-// Serve /public with no-cache for PDFs so latest always shows
+// CORS (optional – safe defaults)
+app.use(cors({ origin: true, credentials: false }));
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+
+// Serve /public with no-cache for PDFs so the latest always shows
 app.use('/public', express.static(PUBLIC_DIR, {
   etag: false,
   lastModified: true,
   setHeaders: (res, filePath) => {
-    if (String(filePath).toLowerCase().endsWith('.pdf')) {
+    if (filePath.toLowerCase().endsWith('.pdf')) {
       res.setHeader('Cache-Control', 'no-store, max-age=0');
       res.setHeader('Pragma', 'no-cache');
       res.setHeader('Expires', '0');
@@ -74,325 +150,280 @@ app.use('/public', express.static(PUBLIC_DIR, {
   }
 }));
 
-// SendGrid inbound uses multipart/form-data
-const upload = multer({ limits: { fieldSize: 2 * 1024 * 1024 } });
+// uploads for inbound
+const upload = multer({ limits: { fieldSize: 1 * 1024 * 1024 } });
 
-// ---------------- HELPERS ----------------
-function safeSlug(slug) {
-  return String(slug || 'default').toLowerCase().replace(/[^a-z0-9-_]/g, '') || 'default';
-}
+// ------------ HELPERS ------------
+function slugDirs(slug) {
+  const safe = String(slug || 'default').toLowerCase().replace(/[^a-z0-9-_]/g, '');
 
-function slugDirs(slugRaw) {
-  const slug = safeSlug(slugRaw);
+  // --- DATA side ---
+  const base = path.join(DATA_DIR, safe);
+  const archive = path.join(base, 'archive');
+  const storePath = path.join(base, 'qa_store.json');
 
-  const dataBase = path.join(DATA_DIR, slug);
-  const dataArchive = path.join(dataBase, 'archive');
+  // --- PUBLIC side ---
+  const publicSlug = path.join(PUBLIC_DIR, safe);
+  const publicArchive = path.join(publicSlug, 'archive');
+  const todayPdf = path.join(publicSlug, 'qa-today.pdf');
 
-  const publicBase = path.join(PUBLIC_DIR, slug);
-  const publicArchive = path.join(publicBase, 'archive');
-
-  const storePath = path.join(dataBase, 'qa_store.json');
-  const todayPdf = path.join(publicBase, 'qa-today.pdf');
-
-  [dataBase, dataArchive, publicBase, publicArchive].forEach(p => {
+  // --- Ensure directories exist ---
+  [base, archive, publicSlug, publicArchive].forEach(p => {
     if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
   });
 
-  return { slug, dataBase, dataArchive, publicBase, publicArchive, storePath, todayPdf };
+  return { base, archive, publicSlug, publicArchive, storePath, todayPdf, slug: safe };
 }
 
-function loadStore(storePath) {
+function loadStore(p) {
   try {
-    const raw = fs.readFileSync(storePath, 'utf8');
-    const parsed = JSON.parse(raw);
-    if (parsed && Array.isArray(parsed.items)) return parsed;
-  } catch {}
-  return { items: [], meta: { lastInboundSig: '' } };
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch {
+    return { items: [] };
+  }
 }
 
-function saveStore(storePath, store) {
-  fs.writeFileSync(storePath, JSON.stringify(store, null, 2));
+function saveStore(p, json) {
+  fs.writeFileSync(p, JSON.stringify(json, null, 2));
 }
 
+// Human-readable company name from slug (title-case-ish)
 function displayNameFromSlug(slug = '') {
   const cleaned = String(slug).replace(/[-_]+/g, ' ').trim();
   return cleaned.replace(/\b\w/g, c => c.toUpperCase());
 }
 
-function sha256(s) {
-  return crypto.createHash('sha256').update(String(s || '')).digest('hex');
-}
 
-function norm(s) {
-  return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
-}
+  
+// --- Entity decode + robust HTML→text ---
+function writeTodayPdf(pdfPath, slug, items = []) {
+  const PDFDocument = require("pdfkit");
+  const fs = require("fs");
+  const path = require("path");
+  const { DateTime } = require("luxon");
 
-function nowTs() {
-  return Date.now();
-}
+  // Ensure items is always an array
+  if (!Array.isArray(items)) items = [];
 
-function newId() {
-  return crypto.randomBytes(8).toString('hex');
-}
+  // Make sure directory exists for PDF output
+  const publicSlug = path.dirname(pdfPath);
+  fs.mkdirSync(publicSlug, { recursive: true });
 
-// ---------- HTML → text ----------
-function decodeEntities(s) {
-  return String(s || '')
-    .replace(/&nbsp;|&#160;|&#xA0;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&#10;|&#x0A;/gi, '\n')
-    .replace(/\u00A0/g, ' ');
-}
 
+  const doc = new PDFDocument({ size: "LETTER", margin: 40 });
+  const tmp = pdfPath + ".tmp";
+  const stream = fs.createWriteStream(tmp);
+  doc.pipe(stream);
+
+  const ts = DateTime.now().setZone(TIMEZONE).toFormat("yyyy-LL-dd HH:mm");
+  const company = displayNameFromSlug(slug);
+
+  doc.fontSize(18).text(`Escalation Q/A — ${company}`, { underline: true });
+  doc.moveDown(0.25);
+  doc.fontSize(10).text(`Generated: ${ts} ${TIMEZONE}`);
+  doc.moveDown();
+
+    if (!items.length) {
+    doc.fontSize(12).text("No entries yet.");
+  } else {
+    items.forEach((it, i) => {
+      doc.moveDown(0.5);
+      doc.fontSize(13).text(`${i + 1}. Q: ${it.q}`);
+
+      if (it.a && String(it.a).trim()) {
+        doc.moveDown(0.2);
+        doc.fontSize(12).text(`   A: ${it.a}`);
+      }
+
+      doc.moveDown(0.4);
+      doc.moveTo(40, doc.y).lineTo(550, doc.y).stroke();
+    });
+  }
+
+  doc.end();
+  
+    return new Promise((resolve, reject) => {
+    stream.on("finish", () => {
+      try {
+        // rename temp file to final
+        fs.mkdirSync(path.dirname(pdfPath), { recursive: true });
+        fs.renameSync(tmp, pdfPath);
+
+        if (process.platform === "darwin") {
+          try {
+            const pdfName = path.basename(pdfPath);
+            const destDir = path.join("/Users/ethanpoto/Desktop/docsbot-backend", slug);
+            fs.mkdirSync(destDir, { recursive: true });
+            fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
+            console.log(`🖥️  Local copy saved for ${slug}`);
+          } catch (mirrorErr) {
+            console.warn("⚠️  Desktop mirror skipped:", mirrorErr.message);
+          }
+        }
+
+        console.log(`✅ PDF updated for ${slug}: ${pdfPath}`);
+        resolve();
+      } catch (err) {
+        console.error("❌ PDF save error:", err);
+        reject(err);
+      }
+    });
+  });
+} 
+
+
+  
+  // Robust text extraction from HTML (if only HTML is provided)
 function htmlToText(html) {
   if (!html) return '';
   let out = String(html);
 
+  // Keep structure
   out = out.replace(/<(\/p|br|\/li|\/div)>/gi, '$&\n');
+
+  // Strip style/script
   out = out.replace(/<style[\s\S]*?<\/style>/gi, '')
            .replace(/<script[\s\S]*?<\/script>/gi, '');
+
+  // Strip tags
   out = out.replace(/<[^>]+>/g, '');
+
+  // Decode entities
   out = decodeEntities(out);
+
+  // Normalize and trim
   out = out.replace(/\r/g, '').trim();
 
   return out;
 }
 
-// ---------- Tenant routing helpers ----------
-function splitList(s) {
-  return String(s || '')
+function listSlugs() {
+  return fs.readdirSync(DATA_DIR).filter(name => {
+    const p = path.join(DATA_DIR, name);
+    try { return fs.statSync(p).isDirectory(); } catch { return false; }
+  });
+}
+
+/**
+ * Find ALL qa+...@replies... recipients in To and CC (header preferred) or envelope.
+ * We will REJECT if more than one tenant candidate is present to prevent cross-tenant bleed.
+ */
+function findQaRepliesCandidates(fields = {}, debug = false) {
+  const splitList = (s) => String(s || '')
     .split(',')
     .map(x => x.trim())
     .filter(Boolean);
-}
 
-function extractAddress(addr) {
-  let a = String(addr || '').trim();
-  const m = a.match(/<([^>]+)>/);
-  if (m) a = m[1].trim();
-  return a;
-}
+  // HEADER SOURCES: To + CC (Mailio often puts QA in CC)
+  const toHeaderList = splitList(fields.to);
+  const ccHeaderList = splitList(fields.cc);
+  const headerAll = [...toHeaderList, ...ccHeaderList];
 
-function findQaRecipients(fields, debug) {
-  const headerAll = [...splitList(fields.to), ...splitList(fields.cc)].map(extractAddress);
+  const headerCandidates = headerAll.filter(addr =>
+    /@.*replies\./i.test(addr) && /^qa\+/i.test((addr.split('@')[0] || ''))
+  );
 
-  const headerCandidates = headerAll.filter(a => /^qa\+/i.test((a.split('@')[0] || '')) && /@.*replies\./i.test(a));
-
+  // ENVELOPE (fallback)
   let envTo = [];
   try {
     const env = JSON.parse(fields.envelope || '{}');
     envTo = Array.isArray(env.to) ? env.to : (env.to ? [env.to] : []);
   } catch {}
+  const envCandidates = envTo.filter(addr =>
+    /@.*replies\./i.test(addr) && /^qa\+/i.test((addr.split('@')[0] || ''))
+  );
 
-  const envCandidates = envTo.map(extractAddress).filter(a => /^qa\+/i.test((a.split('@')[0] || '')) && /@.*replies\./i.test(a));
+  const candidates = headerCandidates.length ? headerCandidates : envCandidates;
 
-  const picked = headerCandidates.length ? headerCandidates : envCandidates;
+  if (debug) console.log('QA RECIPIENT CANDIDATES', {
+    toHeaderList, ccHeaderList, headerCandidates, envCandidates,
+    pickedFrom: headerCandidates.length ? 'header' : 'envelope'
+  });
 
-  if (debug) {
-    console.log('QA ROUTE CANDIDATES', {
-      to: fields.to || '',
-      cc: fields.cc || '',
-      headerCandidates,
-      envCandidates,
-      pickedFrom: headerCandidates.length ? 'header' : 'envelope'
-    });
-  }
-
-  return picked;
+  return candidates;
 }
 
-function deriveSlugFromAddress(addr) {
-  const a = extractAddress(addr);
-  const [local, host] = String(a).split('@');
+/**
+ * Derive a tenant slug from a "to" address.
+ * Supports:
+ *   1) Plus addressing: qa+<slug>@replies.yourdomain.com
+ *   2) Subdomain style:  qa@<slug>.replies.yourdomain.com
+ */
+function deriveSlugFromAddress(toAddrRaw = '') {
+  if (!toAddrRaw) return 'default';
 
-  // qa+slug@replies....
+  // If multiple addresses, pick first.
+  let toAddr = String(toAddrRaw).split(',')[0].trim();
+  // If address is in the form "Name <addr>", extract inside <>
+  const mAngle = toAddr.match(/<([^>]+)>/);
+  if (mAngle) toAddr = mAngle[1];
+
+  const [local, host] = String(toAddr).split('@');
+
+  // Try plus-addressing first: qa+<slug>@replies...
   const plus = (local || '').match(/^[^+]+?\+([a-z0-9][a-z0-9-_]{0,63})$/i);
-  if (plus) return safeSlug(plus[1]);
+  if (plus) {
+    return plus[1].toLowerCase().replace(/[^a-z0-9-_]/g, '') || 'default';
+  }
 
-  // qa@slug.replies....
+  // Fallback: <slug>.replies.<domain>
   const mHost = (host || '').toLowerCase().match(/^([a-z0-9][a-z0-9-_]{0,63})\.replies\./i);
-  if (mHost) return safeSlug(mHost[1]);
+  if (mHost) {
+    return mHost[1].replace(/[^a-z0-9-_]/g, '') || 'default';
+  }
 
   return 'default';
 }
 
-function deriveSlugFromSubject(subject) {
-  // [1st Answer Bot][slug] ...
-  const s = String(subject || '');
-  const m = s.match(/^\s*\[1st\s*Answer\s*Bot\]\s*\[([a-z0-9][a-z0-9-_]{0,63})\]/i);
-  return m ? safeSlug(m[1]) : '';
+// --- NEW: tenant tag extractor ---
+function extractTenantTag(s) {
+  // Matches "[tenant: slug]" at the very start (allow whitespace)
+  const m = String(s || '').match(/^\s*\[\s*tenant\s*:\s*([a-z0-9][a-z0-9-_]{0,63})\s*\]/i);
+  return m ? m[1].toLowerCase() : '';
 }
 
-// ---------- Email body parsing ----------
-function stripQuotedThread(text) {
-  const t = String(text || '').replace(/\r/g, '');
+/**
+ * Parse inbound body to detect:
+ *   - QA: both Q and A present
+ *   - Q:  Q present, A missing
+ *   - A:  A present, Q missing  (used to fill the most recent pending Q)
+ *
+ * Returns { mode: 'QA'|'Q'|'A'|'NONE', q?: string, a?: string }
+ */
+function parseQAOrAnswerOnly(raw = '') {
+  const t = String(raw || '');
 
-  const cutMarkers = [
-    /^\s*On .* wrote:\s*$/im,
-    /^\s*From:\s*.*$/im,
-    /^\s*Sent:\s*.*$/im,
-    /^\s*To:\s*.*$/im,
-    /^\s*Subject:\s*.*$/im,
-    /^\s*-----Original Message-----\s*$/im,
-    /^\s*________________________________\s*$/im,
-    /^\s*>/m
-  ];
+  // Slightly more forgiving Q: pattern (Q: / Q- / Q – )
+  const qMatch = t.match(/^\s*Q\s*[:\-–]\s*(.+)$/im);
 
-  let cutAt = -1;
-  for (const re of cutMarkers) {
-    const idx = t.search(re);
-    if (idx !== -1) cutAt = cutAt === -1 ? idx : Math.min(cutAt, idx);
-  }
-  return (cutAt === -1 ? t : t.slice(0, cutAt)).trim();
-}
-
-function stripSignature(text) {
-  let t = String(text || '').replace(/\r/g, '').trim();
-
-  const sigMarkers = [
-    /^\s*--\s*$/m,
-    /^\s*thanks[,\s]*$/im,
-    /^\s*thank you[,\s]*$/im,
-    /^\s*best[,\s]*$/im,
-    /^\s*regards[,\s]*$/im,
-    /^\s*sincerely[,\s]*$/im,
-    /^\s*sent from my/i
-  ];
-
-  let cutAt = -1;
-  for (const re of sigMarkers) {
-    const idx = t.search(re);
-    if (idx !== -1) cutAt = cutAt === -1 ? idx : Math.min(cutAt, idx);
-  }
-  if (cutAt !== -1) t = t.slice(0, cutAt).trim();
-
-  t = t.replace(/\n{3,}/g, '\n\n').trim();
-  return t;
-}
-
-function parseQA(rawText) {
-  const original = String(rawText || '').replace(/\r/g, '').trim();
-  const cleaned = stripQuotedThread(original);
-
-  const qMatch = cleaned.match(/^\s*Q\s*[:\-–]\s*(.+)$/im);
-  const aMatch = cleaned.match(/^\s*A\s*:\s*([\s\S]+)$/im);
-
-  let q = qMatch ? qMatch[1].trim() : '';
-  let a = '';
-
+  // Grab first A: block (if any) — everything until a common quote marker or another Q:
+  let aMatch = t.match(/^\s*A\s*:\s*([\s\S]+)$/im);
+  let aText = '';
   if (aMatch) {
-    a = aMatch[1];
-    const cutAt = a.search(/^\s*(Q\s*[:\-–]|On .* wrote:|From:|Sent:|To:|Subject:|-----|>)/im);
-    if (cutAt > -1) a = a.slice(0, cutAt);
-    a = stripSignature(a.trim());
+    aText = aMatch[1];
+    const cutAt = aText.search(/^\s*(Q\s*[:\-–]|On .* wrote:|From:|Sent:|-----|>)/im);
+    if (cutAt > -1) aText = aText.slice(0, cutAt);
+    aText = aText.trim();
   }
+
+  const q = qMatch ? qMatch[1].trim() : '';
+  const a = aText;
 
   if (q && a) return { mode: 'QA', q, a };
   if (q && !a) return { mode: 'Q', q };
   if (!q && a) return { mode: 'A', a };
-
-  const lines = cleaned.split('\n').map(l => l.trim()).filter(Boolean);
-  if (!lines.length) return { mode: 'NONE' };
-
-  const questionLine = lines.find(l => /\?\s*$/.test(l));
-  if (questionLine) {
-    q = questionLine;
-    const qIndex = lines.indexOf(questionLine);
-    const rest = lines.slice(qIndex + 1).join('\n').trim();
-    if (rest) {
-      a = stripSignature(rest);
-      return { mode: 'QA', q, a };
-    }
-    return { mode: 'Q', q };
-  }
-
-  q = lines[0];
-  const rest = lines.slice(1).join('\n').trim();
-  if (rest) {
-    a = stripSignature(rest);
-    return { mode: 'QA', q, a };
-  }
-
-  return { mode: 'Q', q };
+  return { mode: 'NONE' };
 }
 
-// ---------- PDF generation ----------
-function writeTodayPdfAtomic(pdfPath, slug, items) {
-  return new Promise((resolve, reject) => {
-    try {
-      const tmp = pdfPath + '.tmp';
-      fs.mkdirSync(path.dirname(pdfPath), { recursive: true });
+const isPendingItem = (it) => it && ((!it.a || !String(it.a).trim()) || it.status === 'pending');
+const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
 
-      const doc = new PDFDocument({ size: 'LETTER', margin: 40 });
-      const stream = fs.createWriteStream(tmp);
-      doc.pipe(stream);
-
-      const ts = DateTime.now().setZone(TIMEZONE).toFormat('yyyy-LL-dd HH:mm');
-      const company = displayNameFromSlug(slug);
-
-      doc.fontSize(18).text(`Q/A — ${company} (Today)`, { underline: true });
-      doc.moveDown(0.25);
-      doc.fontSize(10).text(`Generated: ${ts} ${TIMEZONE}`);
-      doc.moveDown();
-
-      if (!items.length) {
-        doc.fontSize(12).text('No entries yet for today.');
-      } else {
-        items.forEach((entry, i) => {
-          const ans = (entry.a && String(entry.a).trim()) ? entry.a : '(pending)';
-          doc.moveDown(0.5);
-          doc.fontSize(13).text(`${i + 1}. Q: ${entry.q}`);
-          doc.moveDown(0.2);
-          doc.fontSize(12).text(`   A: ${ans}`);
-          doc.moveDown(0.4);
-          doc.moveTo(40, doc.y).lineTo(550, doc.y).stroke();
-        });
-      }
-
-      doc.end();
-
-      stream.on('finish', () => {
-        try {
-          fs.renameSync(tmp, pdfPath);
-          resolve();
-        } catch (e) {
-          reject(e);
-        }
-      });
-      stream.on('error', reject);
-    } catch (e) {
-      reject(e);
-    }
-  });
-}
-
-// ---------- Per-slug serialization ----------
-const slugQueues = new Map();
-
-function withSlugLock(slug, fn) {
-  const key = safeSlug(slug);
-  const prev = slugQueues.get(key) || Promise.resolve();
-
-  const next = prev
-    .catch(() => {})
-    .then(fn);
-
-  slugQueues.set(key, next.finally(() => {
-    if (slugQueues.get(key) === next) slugQueues.delete(key);
-  }));
-
-  return next;
-}
-
-// ---------------- ROUTES ----------------
+// ------------ BASIC ROUTES ------------
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, time: new Date().toISOString(), build: BUILD, timezone: TIMEZONE });
+  res.json({ ok: true, time: new Date().toISOString(), build: BUILD, debugInbound: DEBUG_INBOUND_ENV });
 });
 
+// Fallback health for Render (some templates check /api/status)
 app.get('/api/status', (_req, res) => {
   res.json({ ok: true, note: 'prefer /health', time: new Date().toISOString(), build: BUILD });
 });
@@ -400,27 +431,74 @@ app.get('/api/status', (_req, res) => {
 app.get('/', (_req, res) => {
   const idx = path.join(PUBLIC_DIR, 'index.html');
   if (fs.existsSync(idx)) return res.sendFile(idx);
-  res.type('html').send('<h1>1st Answer Bot backend</h1><p>OK</p>');
+  res.type('html').send('<h1>DocsBot Backend (multi-tenant)</h1><p>OK</p>');
 });
 
+// ------------ PER-COMPANY STATUS ------------
 app.get('/c/:slug/api/status', (req, res) => {
-  const { slug, storePath } = slugDirs(req.params.slug);
+  const raw = (req.params.slug || '').toLowerCase();
+  if (!raw) return res.status(400).json({ error: 'missing slug' });
+  const { storePath, slug } = slugDirs(raw);
   const store = loadStore(storePath);
   const todayPdfUrl = `${BASE_URL}/public/${encodeURIComponent(slug)}/qa-today.pdf`;
-  const pending = (store.items || []).filter(x => !x.a || !String(x.a).trim()).length;
-  res.json({ slug, count: store.items.length, pending, todayPdfUrl });
+
+  res.json({ slug, count: store.items.length, todayPdfUrl });
 });
 
+// Quick peek of last N items (debugging)
 app.get('/c/:slug/api/peek', (req, res) => {
-  const { slug, storePath } = slugDirs(req.params.slug);
+  const raw = (req.params.slug || '').toLowerCase();
   const limit = Math.max(1, Math.min(50, parseInt(req.query.limit || '5', 10)));
+  const { storePath } = slugDirs(raw);
   const store = loadStore(storePath);
-  res.json({ slug, count: store.items.length, last: store.items.slice(-limit) });
+  const items = store.items.slice(-limit);
+  res.json({ slug: raw, count: store.items.length, last: items });
 });
 
-// Manual rollover (archive now + reset)
-app.post('/c/:slug/api/archive-now', async (req, res) => {
-  const { slug, storePath, todayPdf, dataArchive, publicArchive } = slugDirs(req.params.slug);
+// ---------- ARCHIVES: LIST + DOWNLOAD + MANUAL ROLLOVER ----------
+function listArchiveFiles(archiveDir) {
+  try {
+    const files = fs.readdirSync(archiveDir)
+      .filter(f => /^\d{4}-\d{2}-\d{2}-[a-z0-9-_]+\.pdf$/i.test(f)) // date-first + slug
+      .sort()
+      .reverse();
+    return files;
+  } catch {
+    return [];
+  }
+}
+
+// List archives with direct URLs (PUBLIC archive)
+app.get('/c/:slug/api/archives', (req, res) => {
+  const raw = (req.params.slug || '').toLowerCase();
+  const { publicArchive, slug } = slugDirs(raw);
+  const files = listArchiveFiles(publicArchive);
+  const baseUrl = `${BASE_URL}/public/${encodeURIComponent(slug)}/archive`;
+  const items = files.map(name => ({
+    name,
+    url: `${baseUrl}/${encodeURIComponent(name)}`
+  }));
+  res.json({ slug, count: items.length, items });
+});
+
+// Serve a specific archived PDF
+app.get('/c/:slug/archive/:file', (req, res) => {
+  const raw = (req.params.slug || '').toLowerCase();
+  const file = String(req.params.file || '');
+  if (!/^\d{4}-\d{2}-\d{2}-[a-z0-9-_]+\.pdf$/i.test(file)) {
+    return res.status(400).send('bad filename');
+  }
+  const { publicArchive } = slugDirs(raw);
+  const full = path.join(publicArchive, file);
+  if (!fs.existsSync(full)) return res.status(404).send('not found');
+  res.setHeader('Cache-Control', 'no-store, max-age=0');
+  return res.sendFile(full);
+});
+
+// Manual rollover (archive now + reset). Secured by ADMIN_SECRET or INBOUND_SECRET.
+app.post('/c/:slug/api/archive-now', (req, res) => {
+  const raw = (req.params.slug || '').toLowerCase();
+  const { archive, publicArchive, storePath, todayPdf, slug } = slugDirs(raw);
 
   const sec = (req.query.secret || req.headers['x-admin-secret'] || req.headers['x-inbound-secret'] || '').toString();
   const okSecret = (ADMIN_SECRET && sec === ADMIN_SECRET) || (INBOUND_SECRET && sec === INBOUND_SECRET);
@@ -428,333 +506,308 @@ app.post('/c/:slug/api/archive-now', async (req, res) => {
 
   const now = DateTime.now().setZone(TIMEZONE);
   const day = now.toFormat('yyyy-LL-dd');
+
+  // Ensure today's PDF reflects current store
+    // Ensure escalation PDF reflects current store
+  const store = loadStore(storePath);
+  writeTodayPdf(todayPdf, slug, store.items || []);
+
+  // Copy to both private and public archives (from escalation-qa.pdf)
   const filename = `${day}-${slug}.pdf`;
+  const srcPdf = todayPdf;
+  const outPrivate = path.join(archive, filename);
+  const outPublic  = path.join(publicArchive, filename);
+  try { fs.copyFileSync(srcPdf, outPrivate); } catch (e) {
+    return res.status(500).json({ ok: false, error: 'copy_private_failed', detail: String(e) });
+  }
+  try { fs.copyFileSync(srcPdf, outPublic); } catch (e) {
+    return res.status(500).json({ ok: false, error: 'copy_public_failed', detail: String(e) });
+  }
 
-  await withSlugLock(slug, async () => {
-    const store = loadStore(storePath);
-    await writeTodayPdfAtomic(todayPdf, slug, store.items || []);
+  // Reset store and rewrite an empty escalation file
+  saveStore(storePath, { items: [] });
+  writeTodayPdf(todayPdf, slug, store.items || []);
 
-    try { fs.copyFileSync(todayPdf, path.join(dataArchive, filename)); } catch {}
-
-    if (ENABLE_PUBLIC_ARCHIVES) {
-      try { fs.copyFileSync(todayPdf, path.join(publicArchive, filename)); } catch {}
-    }
-
-    saveStore(storePath, { items: [], meta: { lastInboundSig: '' } });
+  return res.json({ 
+    ok: true, 
+    slug, 
+    archivedPrivate: path.basename(outPrivate), 
+    archivedPublic: path.basename(outPublic) 
   });
-
-  await writeTodayPdfAtomic(todayPdf, slug, []);
-  res.json({ ok: true, slug, archived: filename, publicArchived: ENABLE_PUBLIC_ARCHIVES });
 });
 
-// ---------------- INBOUND ----------------
-app.post('/inbound', upload.any(), (req, res) => {
-  const debug = DEBUG_INBOUND_ENV || /^(1|true|yes)$/i.test(String(req.query.debug || ''));
+// ------------ INBOUND (SendGrid Inbound Parse) ------------
+app.post('/inbound', upload.any(), async (req, res) => {
+  try {
+    const DEBUG_INBOUND = DEBUG_INBOUND_ENV || /^(1|true|yes)$/i.test(String(req.query.debug || ''));
 
-  if (INBOUND_SECRET) {
-    const h = (req.headers['x-inbound-secret'] || '').toString();
-    const q = (req.query.secret || '').toString();
-    if (h !== INBOUND_SECRET && q !== INBOUND_SECRET) {
-      if (debug) console.warn('Inbound forbidden: bad secret', { hasHeader: Boolean(h), hasQuery: Boolean(q) });
-      return res.status(403).send('forbidden');
-    }
-  }
-
-  const forceSlug = safeSlug((req.query.forceSlug || '').toString().trim());
-  const fields = Object.fromEntries(Object.entries(req.body || {}));
-
-  const bodyText =
-    (fields.text && String(fields.text).trim())
-      ? String(fields.text)
-      : htmlToText(fields.html || '');
-
-  let slug = '';
-  let routeSource = '';
-
-  if (forceSlug && forceSlug !== 'default') {
-    slug = forceSlug;
-    routeSource = 'forceSlug';
-  } else {
-    const candidates = findQaRecipients(fields, debug);
-
-    if (candidates.length > 1) {
-      if (debug) console.warn('Multiple tenant recipients found. Rejecting.', { candidates });
-      return res.status(200).json({ ok: false, error: 'multiple_tenant_recipients', candidates });
-    }
-
-    if (candidates.length === 1) {
-      slug = deriveSlugFromAddress(candidates[0]);
-      routeSource = 'to/cc';
-    } else {
-      const sSlug = deriveSlugFromSubject(fields.subject || '');
-      if (sSlug) {
-        slug = sSlug;
-        routeSource = 'subject';
+    // Shared secret — accept header OR query (SendGrid can't add custom headers)
+    if (INBOUND_SECRET) {
+      const h = (req.headers['x-inbound-secret'] || '').toString();
+      const q = (req.query.secret || '').toString();
+      if (h !== INBOUND_SECRET && q !== INBOUND_SECRET) {
+        if (DEBUG_INBOUND) console.warn('Inbound forbidden: bad secret', { hasHeader: Boolean(h), hasQuery: Boolean(q) });
+        return res.status(403).send('forbidden');
       }
     }
-  }
 
-  if (!slug) {
-    if (debug) console.warn('No tenant slug detected', { to: fields.to, cc: fields.cc, subject: fields.subject });
-    return res.status(200).json({ ok: false, error: 'no_tenant_slug' });
-  }
+    const fields = Object.fromEntries(Object.entries(req.body || {}));
 
-  const parsed = parseQA(bodyText);
-  if (parsed.mode === 'NONE') {
-    if (debug) console.warn('Inbound parse failed', { slug, sample: String(bodyText).slice(0, 250) });
-    return res.status(200).json({ ok: false, slug, error: 'parse_failed' });
-  }
+    // Optional override for testing: ?forceSlug=<tenant>
+    const forceSlug = (req.query.forceSlug || '').toString().trim();
+    let derivedSlug = '';
 
-  withSlugLock(slug, async () => {
-    const { storePath, todayPdf } = slugDirs(slug);
+    // Prefer plain text; otherwise convert HTML to text (declared 'let' so we can strip the tenant tag)
+    let bodyText =
+      (fields.text && fields.text.trim())
+        ? fields.text
+        : htmlToText(fields.html || '');
+
+    // Extract tenant tag from the very first line, e.g., "[tenant: serverpartners]"
+    const tagSlug = extractTenantTag(bodyText);
+
+    if (forceSlug) {
+      derivedSlug = forceSlug.toLowerCase().replace(/[^a-z0-9-_]/g, '');
+      if (DEBUG_INBOUND) console.log('FORCED_SLUG', { derivedSlug });
+    } else {
+      const candidates = findQaRepliesCandidates(fields, DEBUG_INBOUND);
+      if (!candidates.length) {
+        if (DEBUG_INBOUND) console.warn('No qa+...@replies... recipient found', { to: fields.to, cc: fields.cc, envelope: fields.envelope });
+        return res.status(200).json({ ok: false, error: 'no_tenant_recipient' });
+      }
+      if (candidates.length > 1) {
+        if (DEBUG_INBOUND) console.warn('Multiple tenant recipients in one email — rejecting to prevent cross-tenant update', { candidates });
+        return res.status(200).json({ ok: false, error: 'multiple_tenant_recipients', candidates });
+      }
+      derivedSlug = deriveSlugFromAddress(candidates[0]);
+    }
+
+    // If a tenant tag exists and doesn't match the derived slug, ignore this webhook
+    if (tagSlug && tagSlug !== derivedSlug) {
+      if (DEBUG_INBOUND) console.warn('Tenant tag mismatch — ignoring message', { tagSlug, derivedSlug });
+      return res.status(200).json({ ok: true, ignored: true, reason: 'tenant_tag_mismatch', tagSlug, derivedSlug });
+    }
+
+    // If the tag matches, strip the tag line before parsing so it doesn’t appear in PDFs
+    if (tagSlug) {
+      const i = bodyText.indexOf('\n');
+      bodyText = (i >= 0 ? bodyText.slice(i + 1) : '').trim();
+    }
+
+    const parsed = parseQAOrAnswerOnly(bodyText);
+    if (DEBUG_INBOUND) console.log('INBOUND PARSED', { slug: derivedSlug, mode: parsed.mode, hasQ: !!parsed.q, hasA: !!parsed.a });
+
+    if (parsed.mode === 'NONE') {
+      if (DEBUG_INBOUND) console.warn('Inbound parse failed (no Q:/A:)', { derivedSlug, sample: bodyText.slice(0, 200) });
+      return res.status(200).json({ ok: false, error: 'no_q_or_a_found' });
+    }
+
+    const { storePath, todayPdf, slug } = slugDirs(derivedSlug);
     const store = loadStore(storePath);
 
-    const inboundSig = ENABLE_IDEMPOTENCY
-      ? sha256(JSON.stringify({
-          slug,
-          subject: fields.subject || '',
-          from: fields.from || '',
-          mode: parsed.mode,
-          q: parsed.q || '',
-          a: parsed.a || ''
-        }))
-      : '';
-
-    if (ENABLE_IDEMPOTENCY && store.meta && store.meta.lastInboundSig === inboundSig) {
-      if (debug) console.log('Idempotent inbound skip', { slug });
-      return;
-    }
-
-    const items = Array.isArray(store.items) ? store.items : [];
-    store.items = items;
-    store.meta = store.meta || {};
-
-    const upsertAnswered = (qText, aText) => {
-      const qn = norm(qText);
-
-      if (ENABLE_DEDUPE) {
-        for (let i = items.length - 1; i >= 0; i--) {
-          const entry = items[i];
-          if (!entry || !entry.q) continue;
-          if (norm(entry.q) !== qn) continue;
-
-          entry.a = aText;
-          entry.status = 'answered';
-          entry.answeredAt = nowTs();
-          entry.updatedAt = nowTs();
-          return { deduped: true, id: entry.id };
-        }
-      }
-
-      const id = newId();
-      items.push({
-        id,
-        q: qText,
-        a: aText,
-        status: 'answered',
-        createdAt: nowTs(),
-        answeredAt: nowTs(),
-        updatedAt: nowTs(),
-        source: 'email'
-      });
-      return { deduped: false, id };
-    };
-
-    const addPending = (qText) => {
-      if (ENABLE_DEDUPE) {
-        const qn = norm(qText);
-        for (let i = items.length - 1; i >= 0; i--) {
-          const entry = items[i];
-          if (!entry || !entry.q) continue;
-          if (norm(entry.q) === qn && (!entry.a || !String(entry.a).trim())) {
-            entry.updatedAt = nowTs();
-            return { deduped: true, id: entry.id };
-          }
-        }
-      }
-
-      const id = newId();
-      items.push({
-        id,
-        q: qText,
-        a: '',
-        status: 'pending',
-        createdAt: nowTs(),
-        updatedAt: nowTs(),
-        source: 'email'
-      });
-      return { deduped: false, id };
-    };
-
-    const fillMostRecentPending = (aText) => {
-      for (let i = items.length - 1; i >= 0; i--) {
-        const entry = items[i];
-        if (!entry) continue;
-        if (!entry.a || !String(entry.a).trim() || entry.status === 'pending') {
-          entry.a = aText;
-          entry.status = 'answered';
-          entry.answeredAt = nowTs();
-          entry.updatedAt = nowTs();
-          return { filled: true, id: entry.id };
-        }
-      }
-      return { filled: false, id: '' };
-    };
-
-    let modeResult = parsed.mode;
+    let resultMode = parsed.mode;
 
     if (parsed.mode === 'QA') {
-      const resUp = upsertAnswered(parsed.q, parsed.a);
-      modeResult = resUp.deduped ? 'QA->deduped_update' : 'QA->created_new';
+      // Try to close a matching pending by question; else add answered
+      let matched = false;
+      for (let i = store.items.length - 1; i >= 0; i--) {
+        const it = store.items[i];
+        if (isPendingItem(it) && norm(it.q) === norm(parsed.q)) {
+          it.a = parsed.a;
+          it.status = 'answered';
+          it.answeredTs = Date.now();
+          matched = true;
+          resultMode = 'QA->matched_pending';
+          break;
+        }
+      }
+      if (!matched) {
+        store.items.push({
+          q: parsed.q,
+          a: parsed.a,
+          status: 'answered',
+          ts: Date.now(),
+          source: 'email'
+        });
+        resultMode = 'QA->created_new';
+      }
     } else if (parsed.mode === 'Q') {
-      const resPend = addPending(parsed.q);
-      modeResult = resPend.deduped ? 'Q->deduped' : 'Q->created_pending';
+      store.items.push({
+        q: parsed.q,
+        a: '',
+        status: 'pending',
+        ts: Date.now(),
+        source: 'email'
+      });
     } else if (parsed.mode === 'A') {
-      const filled = fillMostRecentPending(parsed.a);
-      if (filled.filled) {
-        modeResult = 'A->filled_pending';
-      } else {
-        upsertAnswered('(unspecified question)', parsed.a);
-        modeResult = 'A->stored_without_question';
+      // Fill most recent pending item
+      let updated = false;
+      for (let i = store.items.length - 1; i >= 0; i--) {
+        const it = store.items[i];
+        if (!it) continue;
+        if (isPendingItem(it)) {
+          it.a = parsed.a;
+          it.status = 'answered';
+          it.answeredTs = Date.now();
+          updated = true;
+          resultMode = 'A->updated_last_pending';
+          break;
+        }
+      }
+      if (!updated) {
+        // No pending found — store as standalone entry to avoid losing the answer
+        store.items.push({
+          q: '(unspecified question)',
+          a: parsed.a,
+          status: 'answered',
+          ts: Date.now(),
+          source: 'email'
+        });
+        resultMode = 'A->no_pending_created_new';
       }
     }
 
-    store.meta.lastInboundSig = inboundSig;
-
+    
+    
     saveStore(storePath, store);
-    await writeTodayPdfAtomic(todayPdf, slug, store.items || []);
+    await writeTodayPdf(path.join(PUBLIC_DIR, slug, 'qa-today.pdf'), slug, store.items);
+    await uploadToDocsBot(slug, path.join(PUBLIC_DIR, slug, 'qa-today.pdf'));
 
-    if (debug) {
-      console.log('INBOUND OK', { slug, routeSource, mode: parsed.mode, modeResult, total: store.items.length });
+
+
+
+    // (Optional) persist raw inbound for debugging
+    if (DEBUG_INBOUND) {
+      try {
+        const dbg = {
+          to: fields.to || '',
+          cc: fields.cc || '',
+          envelope: fields.envelope || '',
+          derivedSlug: slug,
+          subject: fields.subject || '',
+          receivedAt: new Date().toISOString(),
+          parsed
+        };
+        fs.writeFileSync(
+          path.join(DATA_DIR, slug, `inbound_${Date.now()}.json`),
+          JSON.stringify(dbg, null, 2)
+        );
+      } catch {}
     }
-  })
-    .then(() => res.status(200).json({ ok: true, slug, routeSource, mode: parsed.mode }))
-    .catch((e) => {
-      console.error('Inbound error', e);
-      res.status(200).json({ ok: false, slug, error: 'inbound_exception' });
-    });
+
+    const anyPending = store.items.some(it => (!it.a || !String(it.a).trim()));
+    return res.status(200).json({ ok: true, slug, mode: resultMode, pending: anyPending, added: 1 });
+  } catch (err) {
+    console.error('Inbound error:', err);
+    return res.status(200).json({ ok: false, error: 'inbound exception' });
+  }
 });
 
-// ---------------- NIGHTLY ARCHIVE / RESET ----------------
-cron.schedule('59 23 * * *', async () => {
+// ------------ NIGHTLY ARCHIVE/RESET (per company) ------------
+cron.schedule('59 23 * * *', () => {
   try {
-    const day = DateTime.now().setZone(TIMEZONE).toFormat('yyyy-LL-dd');
-    const cutoff = DateTime.now().setZone(TIMEZONE).minus({ days: ARCHIVE_RETENTION_DAYS });
+    const zone = TIMEZONE;
+    const day = DateTime.now().setZone(zone).toFormat('yyyy-LL-dd');
+    const cutoff = DateTime.now().minus({ days: ARCHIVE_RETENTION_DAYS });
 
-    const slugs = fs.readdirSync(DATA_DIR).filter(name => {
-      const p = path.join(DATA_DIR, name);
-      try { return fs.statSync(p).isDirectory(); } catch { return false; }
-    });
+    const slugs = listSlugs();
+    slugs.forEach(slug => {
+      const { storePath, archive, publicArchive, todayPdf } = slugDirs(slug);
 
-    for (const raw of slugs) {
-      const slug = safeSlug(raw);
+     // ensure escalation-qa.pdf exists before copying
+const store = loadStore(storePath);
+writeTodayPdf(slug, store.items || []);
 
-      await withSlugLock(slug, async () => {
-        const { storePath, todayPdf, dataArchive, publicArchive } = slugDirs(slug);
-        const store = loadStore(storePath);
+// Copy escalation file to both private and public archives with date-first filename
+const filename = `${day}-${slug}.pdf`;
+const srcPdf = todayPdf;
 
-        if (!fs.existsSync(todayPdf)) {
-          await writeTodayPdfAtomic(todayPdf, slug, store.items || []);
-        }
 
-        const filename = `${day}-${slug}.pdf`;
-        try { fs.copyFileSync(todayPdf, path.join(dataArchive, filename)); } catch (e) {
-          console.error('Archive copy failed (private)', { slug, e: String(e) });
-        }
+try {
+  fs.copyFileSync(srcPdf, path.join(archive, filename));
+} catch (e) {
+  console.error('Archive copy (private) failed', { slug, e: String(e) });
+}
+try {
+  fs.copyFileSync(srcPdf, path.join(publicArchive, filename));
+} catch (e) {
+  console.error('Archive copy (public) failed', { slug, e: String(e) });
+}
+console.log('Archived PDF', { slug, private: path.join(archive, filename), public: path.join(publicArchive, filename) });
 
-        if (ENABLE_PUBLIC_ARCHIVES) {
-          try { fs.copyFileSync(todayPdf, path.join(publicArchive, filename)); } catch (e) {
-            console.error('Archive copy failed (public)', { slug, e: String(e) });
-          }
-        }
+// reset store and rewrite an empty escalation file
+saveStore(storePath, { items: [] });
+writeTodayPdf(todayPdf, slug, []);
 
-        saveStore(storePath, { items: [], meta: { lastInboundSig: '' } });
-        await writeTodayPdfAtomic(todayPdf, slug, []);
-      });
 
-      // Purge old private archives
+
+      // purge old archives (private + public)
       try {
-        const { dataArchive } = slugDirs(slug);
-        const files = fs.readdirSync(dataArchive)
-          .filter(f => /^\d{4}-\d{2}-\d{2}-[a-z0-9-_]+\.pdf$/i.test(f))
-          .sort();
-
-        for (const f of files) {
-          const d = f.slice(0, 10);
-          const dt = DateTime.fromFormat(d, 'yyyy-LL-dd').setZone(TIMEZONE);
+        const filesPriv = fs.readdirSync(archive);
+        filesPriv.forEach(f => {
+          if (!/^\d{4}-\d{2}-\d{2}-[a-z0-9-_]+\.pdf$/i.test(f)) return;
+          const d = f.slice(0, 10); // yyyy-mm-dd
+          const dt = DateTime.fromFormat(d, 'yyyy-LL-dd');
           if (dt.isValid && dt < cutoff) {
-            try { fs.unlinkSync(path.join(dataArchive, f)); } catch {}
+            fs.unlinkSync(path.join(archive, f));
           }
-        }
-
-        if (ARCHIVE_CAP > 0) {
-          const remaining = fs.readdirSync(dataArchive)
-            .filter(f => /^\d{4}-\d{2}-\d{2}-[a-z0-9-_]+\.pdf$/i.test(f))
-            .sort();
-          const extra = remaining.length - ARCHIVE_CAP;
-          if (extra > 0) {
-            for (let i = 0; i < extra; i++) {
-              try { fs.unlinkSync(path.join(dataArchive, remaining[i])); } catch {}
-            }
-          }
-        }
+        });
       } catch (e) {
         console.error('Archive purge failed (private)', { slug, e: String(e) });
       }
 
-      // Purge public archives only when enabled
-      if (ENABLE_PUBLIC_ARCHIVES) {
-        try {
-          const { publicArchive } = slugDirs(slug);
-          const files = fs.readdirSync(publicArchive)
-            .filter(f => /^\d{4}-\d{2}-\d{2}-[a-z0-9-_]+\.pdf$/i.test(f));
+      try {
+        const filesPub = fs.readdirSync(publicArchive);
+        filesPub.forEach(f => {
+          if (!/^\d{4}-\d{2}-\d{2}-[a-z0-9-_]+\.pdf$/i.test(f)) return;
 
-          for (const f of files) {
-            const d = f.slice(0, 10);
-            const dt = DateTime.fromFormat(d, 'yyyy-LL-dd').setZone(TIMEZONE);
-            if (dt.isValid && dt < cutoff) {
-              try { fs.unlinkSync(path.join(publicArchive, f)); } catch {}
-            }
+          const d = f.slice(0, 10);
+          const dt = DateTime.fromFormat(d, 'yyyy-LL-dd');
+          if (dt.isValid && dt < cutoff) {
+            fs.unlinkSync(path.join(publicArchive, f));
           }
-        } catch (e) {
-          console.error('Archive purge failed (public)', { slug, e: String(e) });
-        }
+        });
+      } catch (e) {
+        console.error('Archive purge failed (public)', { slug, e: String(e) });
       }
-    }
+    });
   } catch (e) {
     console.error('Archive job failed', e);
   }
 }, { timezone: TIMEZONE });
 
-// ---------------- BOOT PDF SEED ----------------
+// ------------ BOOTSTRAP ------------
 (function ensureBootPdfs() {
-  try {
-    const slugs = fs.readdirSync(DATA_DIR).filter(name => {
-      const p = path.join(DATA_DIR, name);
-      try { return fs.statSync(p).isDirectory(); } catch { return false; }
-    });
-
-    slugs.forEach(async (raw) => {
-      const slug = safeSlug(raw);
-      const { storePath, todayPdf } = slugDirs(slug);
-      const store = loadStore(storePath);
-      try { await writeTodayPdfAtomic(todayPdf, slug, store.items || []); } catch {}
-    });
-  } catch {}
+  // Create an empty "today" PDF for any existing slugs on boot
+  listSlugs().forEach(slug => {
+    const { storePath, todayPdf } = slugDirs(slug);
+    const store = loadStore(storePath);
+    writeTodayPdf(todayPdf, slug, store.items || []);
+  });
 })();
 
-// ---------------- START ----------------
-app.listen(PORT, () => {
-  console.log(`Server listening on ${BASE_URL}`);
-  console.log('Endpoints:', {
-    health: '/health',
-    inbound: '/inbound',
-    status: '/c/:slug/api/status',
-    peek: '/c/:slug/api/peek',
-    pdf: '/public/:slug/qa-today.pdf',
-    archiveNow: '/c/:slug/api/archive-now'
+
+// --- Ensure initial PDFs exist on boot ---
+(function ensureInitialPdfs() {
+  const slugs = ['1stanswerbot', 'serverpartners'];
+  slugs.forEach(slug => {
+    const { storePath, todayPdf } = slugDirs(slug);
+    const store = loadStore(storePath);
+    if (!fs.existsSync(todayPdf)) {
+      writeTodayPdf(todayPdf, slug, store.items || []);
+      console.log(`✅ Bootstrapped initial PDF for: ${slug}`);
+    }
   });
+})();
+
+// ------------ START ------------
+app.listen(PORT, () => {
+  console.log(`Server listening on http://localhost:${PORT}`);
+  console.log(`Health: /health  Status: /api/status  Company status: /c/:slug/api/status  Peek: /c/:slug/api/peek  Archives: /c/:slug/api/archives  Download: /c/:slug/archive/:file  PDFs under /public/:slug/qa-today.pdf`);
 });
 
+
+
+// Graceful-ish error logs
 process.on('unhandledRejection', err => console.error('UNHANDLED REJECTION', err));
 process.on('uncaughtException', err => console.error('UNCAUGHT EXCEPTION', err));
