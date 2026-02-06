@@ -223,22 +223,25 @@ function writeTodayPdf(pdfPath, slug, items = []) {
   doc.fontSize(10).text(`Generated: ${ts} ${TIMEZONE}`);
   doc.moveDown();
 
-  if (!items.length) {
+    if (!items.length) {
     doc.fontSize(12).text("No entries yet.");
   } else {
     items.forEach((it, i) => {
-      const ans = it.a && String(it.a).trim() ? it.a : "(pending)";
       doc.moveDown(0.5);
       doc.fontSize(13).text(`${i + 1}. Q: ${it.q}`);
-      doc.moveDown(0.2);
-      doc.fontSize(12).text(`   A: ${ans}`);
+
+      if (it.a && String(it.a).trim()) {
+        doc.moveDown(0.2);
+        doc.fontSize(12).text(`   A: ${it.a}`);
+      }
+
       doc.moveDown(0.4);
       doc.moveTo(40, doc.y).lineTo(550, doc.y).stroke();
     });
   }
 
   doc.end();
-
+  
     return new Promise((resolve, reject) => {
     stream.on("finish", () => {
       try {
