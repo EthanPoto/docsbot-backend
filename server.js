@@ -233,300 +233,350 @@ function writeTodayPdf(pdfPath, slug, items = []) {
       if (it.a && String(it.a).trim()) {
         doc.moveDown(0.2);
         doc.fontSize(12).text(`   A: ${it.a}`);
-      } else {
-        doc.moveDown(0.2);
-        doc.fontSize(12).fillColor("gray").text("   [No answer yet]").fillColor("black");
       }
+
+      doc.moveDown(0.4);
+      doc.moveTo(40, doc.y).lineTo(550, doc.y).stroke();
     });
   }
 
   doc.end();
+  
+    return new Promise((resolve, reject) => {
+    stream.on("finish", () => {
+      try {
+        // rename temp file to final
+        fs.mkdirSync(path.dirname(pdfPath), { recursive: true });
+        fs.renameSync(tmp, pdfPath);
 
-  stream.on("finish", () => {
-    fs.renameSync(tmp, pdfPath);
+        if (process.platform === "darwin") {
+          try {
+            const pdfName = path.basename(pdfPath);
+            const destDir = path.join("/Users/ethanpoto/Desktop/docsbot-backend", slug);
+            fs.mkdirSync(destDir, { recursive: true });
+            fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
+            console.log(`🖥️  Local copy saved for ${slug}`);
+          } catch (mirrorErr) {
+            console.warn("⚠️  Desktop mirror skipped:", mirrorErr.message);
+          }
+        }
+
+        console.log(`✅ PDF updated for ${slug}: ${pdfPath}`);
+        resolve();
+      } catch (err) {
+        console.error("❌ PDF save error:", err);
+        reject(err);
+      }
+    });
   });
-}
+} 
 
-// normalizer
-function norm(s = '') {
-  return String(s).trim().replace(/\s+/g, ' ').toLowerCase();
-}
 
-function isPendingItem(it) {
-  if (!it) return false;
-  if (it.status === 'pending') return true;
-  return (!it.a || !String(it.a).trim());
+  
+  // Robust text extraction from HTML (if only HTML is provided)
+function htmlToText(html) {
+  if (!html) return '';
+  let out = String(html);
+
+  // Keep structure
+  out = out.replace(/<(\/p|br|\/li|\/div)>/gi, '$&\n');
+
+  // Strip style/script
+  out = out.replace(/<style[\s\S]*?<\/style>/gi, '')
+           .replace(/<script[\s\S]*?<\/script>/gi, '');
+
+  // Strip tags
+  out = out.replace(/<[^>]+>/g, '');
+
+  // Decode entities
+  out = decodeEntities(out);
+
+  // Normalize and trim
+  out = out.replace(/\r/g, '').trim();
+
+  return out;
 }
 
 function listSlugs() {
+  return fs.readdirSync(DATA_DIR).filter(name => {
+    const p = path.join(DATA_DIR, name);
+    try { return fs.statSync(p).isDirectory(); } catch { return false; }
+  });
+}
+
+/**
+ * Find ALL qa+...@replies... recipients in To and CC (header preferred) or envelope.
+ * We will REJECT if more than one tenant candidate is present to prevent cross-tenant bleed.
+ */
+function findQaRepliesCandidates(fields = {}, debug = false) {
+  const splitList = (s) => String(s || '')
+    .split(',')
+    .map(x => x.trim())
+    .filter(Boolean);
+
+  // HEADER SOURCES: To + CC (Mailio often puts QA in CC)
+  const toHeaderList = splitList(fields.to);
+  const ccHeaderList = splitList(fields.cc);
+  const headerAll = [...toHeaderList, ...ccHeaderList];
+
+  const headerCandidates = headerAll.filter(addr =>
+    /@.*replies\./i.test(addr) && /^qa\+/i.test((addr.split('@')[0] || ''))
+  );
+
+  // ENVELOPE (fallback)
+  let envTo = [];
   try {
-    return fs.readdirSync(DATA_DIR).filter(d => {
-      try {
-        return fs.statSync(path.join(DATA_DIR, d)).isDirectory();
-      } catch {
-        return false;
-      }
-    });
+    const env = JSON.parse(fields.envelope || '{}');
+    envTo = Array.isArray(env.to) ? env.to : (env.to ? [env.to] : []);
+  } catch {}
+  const envCandidates = envTo.filter(addr =>
+    /@.*replies\./i.test(addr) && /^qa\+/i.test((addr.split('@')[0] || ''))
+  );
+
+  const candidates = headerCandidates.length ? headerCandidates : envCandidates;
+
+  if (debug) console.log('QA RECIPIENT CANDIDATES', {
+    toHeaderList, ccHeaderList, headerCandidates, envCandidates,
+    pickedFrom: headerCandidates.length ? 'header' : 'envelope'
+  });
+
+  return candidates;
+}
+
+/**
+ * Derive a tenant slug from a "to" address.
+ * Supports:
+ *   1) Plus addressing: qa+<slug>@replies.yourdomain.com
+ *   2) Subdomain style:  qa@<slug>.replies.yourdomain.com
+ */
+function deriveSlugFromAddress(toAddrRaw = '') {
+  if (!toAddrRaw) return 'default';
+
+  // If multiple addresses, pick first.
+  let toAddr = String(toAddrRaw).split(',')[0].trim();
+  // If address is in the form "Name <addr>", extract inside <>
+  const mAngle = toAddr.match(/<([^>]+)>/);
+  if (mAngle) toAddr = mAngle[1];
+
+  const [local, host] = String(toAddr).split('@');
+
+  // Try plus-addressing first: qa+<slug>@replies...
+  const plus = (local || '').match(/^[^+]+?\+([a-z0-9][a-z0-9-_]{0,63})$/i);
+  if (plus) {
+    return plus[1].toLowerCase().replace(/[^a-z0-9-_]/g, '') || 'default';
+  }
+
+  // Fallback: <slug>.replies.<domain>
+  const mHost = (host || '').toLowerCase().match(/^([a-z0-9][a-z0-9-_]{0,63})\.replies\./i);
+  if (mHost) {
+    return mHost[1].replace(/[^a-z0-9-_]/g, '') || 'default';
+  }
+
+  return 'default';
+}
+
+// --- NEW: tenant tag extractor ---
+function extractTenantTag(s) {
+  // Matches "[tenant: slug]" at the very start (allow whitespace)
+  const m = String(s || '').match(/^\s*\[\s*tenant\s*:\s*([a-z0-9][a-z0-9-_]{0,63})\s*\]/i);
+  return m ? m[1].toLowerCase() : '';
+}
+
+/**
+ * Parse inbound body to detect:
+ *   - QA: both Q and A present
+ *   - Q:  Q present, A missing
+ *   - A:  A present, Q missing  (used to fill the most recent pending Q)
+ *
+ * Returns { mode: 'QA'|'Q'|'A'|'NONE', q?: string, a?: string }
+ */
+function parseQAOrAnswerOnly(raw = '') {
+  const t = String(raw || '');
+
+  // Slightly more forgiving Q: pattern (Q: / Q- / Q – )
+  const qMatch = t.match(/^\s*Q\s*[:\-–]\s*(.+)$/im);
+
+  // Grab first A: block (if any) — everything until a common quote marker or another Q:
+  let aMatch = t.match(/^\s*A\s*:\s*([\s\S]+)$/im);
+  let aText = '';
+  if (aMatch) {
+    aText = aMatch[1];
+    const cutAt = aText.search(/^\s*(Q\s*[:\-–]|On .* wrote:|From:|Sent:|-----|>)/im);
+    if (cutAt > -1) aText = aText.slice(0, cutAt);
+    aText = aText.trim();
+  }
+
+  const q = qMatch ? qMatch[1].trim() : '';
+  const a = aText;
+
+  if (q && a) return { mode: 'QA', q, a };
+  if (q && !a) return { mode: 'Q', q };
+  if (!q && a) return { mode: 'A', a };
+  return { mode: 'NONE' };
+}
+
+const isPendingItem = (it) => it && ((!it.a || !String(it.a).trim()) || it.status === 'pending');
+const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+
+// ------------ BASIC ROUTES ------------
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, time: new Date().toISOString(), build: BUILD, debugInbound: DEBUG_INBOUND_ENV });
+});
+
+// Fallback health for Render (some templates check /api/status)
+app.get('/api/status', (_req, res) => {
+  res.json({ ok: true, note: 'prefer /health', time: new Date().toISOString(), build: BUILD });
+});
+
+app.get('/', (_req, res) => {
+  const idx = path.join(PUBLIC_DIR, 'index.html');
+  if (fs.existsSync(idx)) return res.sendFile(idx);
+  res.type('html').send('<h1>DocsBot Backend (multi-tenant)</h1><p>OK</p>');
+});
+
+// ------------ PER-COMPANY STATUS ------------
+app.get('/c/:slug/api/status', (req, res) => {
+  const raw = (req.params.slug || '').toLowerCase();
+  if (!raw) return res.status(400).json({ error: 'missing slug' });
+  const { storePath, slug } = slugDirs(raw);
+  const store = loadStore(storePath);
+  const todayPdfUrl = `${BASE_URL}/public/${encodeURIComponent(slug)}/qa-today.pdf`;
+
+  res.json({ slug, count: store.items.length, todayPdfUrl });
+});
+
+// Quick peek of last N items (debugging)
+app.get('/c/:slug/api/peek', (req, res) => {
+  const raw = (req.params.slug || '').toLowerCase();
+  const limit = Math.max(1, Math.min(50, parseInt(req.query.limit || '5', 10)));
+  const { storePath } = slugDirs(raw);
+  const store = loadStore(storePath);
+  const items = store.items.slice(-limit);
+  res.json({ slug: raw, count: store.items.length, last: items });
+});
+
+// ---------- ARCHIVES: LIST + DOWNLOAD + MANUAL ROLLOVER ----------
+function listArchiveFiles(archiveDir) {
+  try {
+    const files = fs.readdirSync(archiveDir)
+      .filter(f => /^\d{4}-\d{2}-\d{2}-[a-z0-9-_]+\.pdf$/i.test(f)) // date-first + slug
+      .sort()
+      .reverse();
+    return files;
   } catch {
     return [];
   }
 }
 
-// ----- NEW: STRIP EMAIL SIGNATURES & MOBILE FOOTERS -----
-function stripSignatureAndFooters(text) {
-  if (!text) return '';
-  
-  const signaturePatterns = [
-    /\n\s*--+\s*\n/,                          // Standard -- signature delimiter
-    /\n\s*_{3,}\s*\n/,                        // ___ signature delimiter
-    /\nSent from (my )?iPhone/i,              // Sent from iPhone
-    /\nSent from (my )?iPad/i,                // Sent from iPad
-    /\nSent from [\w\s]+/i,                   // Generic "Sent from X"
-    /\nGet Outlook for (iOS|Android)/i,       // Outlook mobile
-    /\n\s*Sent from Mail for Windows/i,       // Windows Mail
-    /\n\s*Best regards?,?\s*\n/i,             // Best regards
-    /\n\s*Sincerely,?\s*\n/i,                 // Sincerely
-    /\n\s*Thanks?,?\s*\n/i,                   // Thanks
-    /\n\s*Cheers,?\s*\n/i,                    // Cheers
-    /\n\s*Regards?,?\s*\n/i                   // Regards
-  ];
-  
-  let cleaned = text;
-  
-  // Find earliest match of any signature pattern
-  let earliestIndex = cleaned.length;
-  
-  for (const pattern of signaturePatterns) {
-    const match = cleaned.match(pattern);
-    if (match && match.index < earliestIndex) {
-      earliestIndex = match.index;
-    }
-  }
-  
-  // Cut at earliest signature marker
-  if (earliestIndex < cleaned.length) {
-    cleaned = cleaned.substring(0, earliestIndex);
-  }
-  
-  return cleaned.trim();
-}
-
-// ----- PARSE EMAIL BODY FOR Q/A -----
-function parseQAOrAnswerOnly(bodyText) {
-  if (!bodyText) return { mode: 'NONE' };
-
-  const lines = bodyText.split('\n').map(ln => ln.trim()).filter(Boolean);
-  let q = '', a = '';
-  let foundQ = false, foundA = false;
-
-  for (const line of lines) {
-    if (/^Q\d*:\s*/i.test(line)) {
-      foundQ = true;
-      q += line.replace(/^Q\d*:\s*/i, '').trim() + ' ';
-    } else if (/^A\d*:\s*/i.test(line)) {
-      foundA = true;
-      // Get everything after A: and strip signatures
-      const rawAnswer = line.replace(/^A\d*:\s*/i, '').trim();
-      a += rawAnswer + ' ';
-    } else {
-      if (foundA) {
-        // Continue collecting answer text until we hit a signature
-        a += line + ' ';
-      } else if (foundQ) {
-        q += line + ' ';
-      }
-    }
-  }
-
-  q = q.trim();
-  a = a.trim();
-  
-  // Strip signatures and footers from the answer
-  if (a) {
-    a = stripSignatureAndFooters(a);
-  }
-
-  if (q && a) return { mode: 'QA', q, a };
-  if (q) return { mode: 'Q', q };
-  if (a) return { mode: 'A', a };
-  return { mode: 'NONE' };
-}
-
-function deriveSlugFromAddress(addr) {
-  const lower = String(addr || '').toLowerCase();
-  if (lower.includes('1stanswerbot')) return '1stanswerbot';
-  if (lower.includes('serverpartners')) return 'serverpartners';
-  return 'default';
-}
-
-// ------------ ROUTES ------------
-
-// 1) Health
-app.get('/health', (req, res) => {
-  return res.status(200).json({ ok: true, build: BUILD });
-});
-
-// 2) Global status (all companies)
-app.get('/api/status', (req, res) => {
-  try {
-    const slugs = listSlugs();
-    const out = [];
-    for (const slug of slugs) {
-      const { storePath, todayPdf } = slugDirs(slug);
-      const store = loadStore(storePath);
-      const pending = store.items.filter(isPendingItem).length;
-      const answered = store.items.filter(it => !isPendingItem(it)).length;
-
-      let pdfUrl = null;
-      try {
-        if (fs.existsSync(todayPdf)) {
-          pdfUrl = `${BASE_URL}/public/${slug}/qa-today.pdf`;
-        }
-      } catch {}
-
-      out.push({ slug, pending, answered, total: store.items.length, pdfUrl });
-    }
-    return res.json({ ok: true, companies: out });
-  } catch (err) {
-    console.error('Global status error:', err);
-    return res.status(500).json({ ok: false, error: String(err) });
-  }
-});
-
-// 3) Company-specific status
-app.get('/c/:slug/api/status', (req, res) => {
-  try {
-    const slug = req.params.slug;
-    const { storePath, todayPdf } = slugDirs(slug);
-    const store = loadStore(storePath);
-    const pending = store.items.filter(isPendingItem).length;
-    const answered = store.items.filter(it => !isPendingItem(it)).length;
-
-    let pdfUrl = null;
-    try {
-      if (fs.existsSync(todayPdf)) {
-        pdfUrl = `${BASE_URL}/public/${slug}/qa-today.pdf`;
-      }
-    } catch {}
-
-    return res.json({ ok: true, slug, pending, answered, total: store.items.length, pdfUrl });
-  } catch (err) {
-    console.error(`Status error (${req.params.slug}):`, err);
-    return res.status(500).json({ ok: false, error: String(err) });
-  }
-});
-
-// 4) Peek items (ADMIN only)
-app.get('/c/:slug/api/peek', (req, res) => {
-  const secret = req.query.secret || req.headers['x-admin-secret'];
-  if (secret !== ADMIN_SECRET) return res.status(403).json({ ok: false, error: 'forbidden' });
-
-  try {
-    const slug = req.params.slug;
-    const { storePath } = slugDirs(slug);
-    const store = loadStore(storePath);
-    return res.json({ ok: true, slug, items: store.items });
-  } catch (err) {
-    console.error(`Peek error (${req.params.slug}):`, err);
-    return res.status(500).json({ ok: false, error: String(err) });
-  }
-});
-
-// 5) List archived PDFs
+// List archives with direct URLs (PUBLIC archive)
 app.get('/c/:slug/api/archives', (req, res) => {
-  try {
-    const slug = req.params.slug;
-    const { publicArchive } = slugDirs(slug);
-
-    const files = fs.readdirSync(publicArchive)
-      .filter(f => f.toLowerCase().endsWith('.pdf'))
-      .sort((a, b) => b.localeCompare(a)); // newest first
-
-    const urls = files.map(f => `${BASE_URL}/public/${slug}/archive/${encodeURIComponent(f)}`);
-    return res.json({ ok: true, slug, archives: files, urls });
-  } catch (err) {
-    console.error(`Archive list error (${req.params.slug}):`, err);
-    return res.status(500).json({ ok: false, error: String(err) });
-  }
+  const raw = (req.params.slug || '').toLowerCase();
+  const { publicArchive, slug } = slugDirs(raw);
+  const files = listArchiveFiles(publicArchive);
+  const baseUrl = `${BASE_URL}/public/${encodeURIComponent(slug)}/archive`;
+  const items = files.map(name => ({
+    name,
+    url: `${baseUrl}/${encodeURIComponent(name)}`
+  }));
+  res.json({ slug, count: items.length, items });
 });
 
-// 6) Download specific archive PDF
+// Serve a specific archived PDF
 app.get('/c/:slug/archive/:file', (req, res) => {
-  try {
-    const slug = req.params.slug;
-    const file = req.params.file;
-    const { publicArchive } = slugDirs(slug);
-    const fullPath = path.join(publicArchive, file);
-
-    if (!fs.existsSync(fullPath)) {
-      return res.status(404).json({ ok: false, error: 'not found' });
-    }
-
-    return res.sendFile(fullPath);
-  } catch (err) {
-    console.error(`Archive download error:`, err);
-    return res.status(500).json({ ok: false, error: String(err) });
+  const raw = (req.params.slug || '').toLowerCase();
+  const file = String(req.params.file || '');
+  if (!/^\d{4}-\d{2}-\d{2}-[a-z0-9-_]+\.pdf$/i.test(file)) {
+    return res.status(400).send('bad filename');
   }
+  const { publicArchive } = slugDirs(raw);
+  const full = path.join(publicArchive, file);
+  if (!fs.existsSync(full)) return res.status(404).send('not found');
+  res.setHeader('Cache-Control', 'no-store, max-age=0');
+  return res.sendFile(full);
 });
 
-// 7) Inbound email webhook (SendGrid Parse)
-// This always expects multipart form data with 'to', 'cc', 'envelope', 'subject', 'text'
-const DEBUG_INBOUND = DEBUG_INBOUND_ENV;
+// Manual rollover (archive now + reset). Secured by ADMIN_SECRET or INBOUND_SECRET.
+app.post('/c/:slug/api/archive-now', (req, res) => {
+  const raw = (req.params.slug || '').toLowerCase();
+  const { archive, publicArchive, storePath, todayPdf, slug } = slugDirs(raw);
 
-app.post('/inbound', upload.none(), async (req, res) => {
+  const sec = (req.query.secret || req.headers['x-admin-secret'] || req.headers['x-inbound-secret'] || '').toString();
+  const okSecret = (ADMIN_SECRET && sec === ADMIN_SECRET) || (INBOUND_SECRET && sec === INBOUND_SECRET);
+  if (!okSecret) return res.status(403).send('forbidden');
+
+  const now = DateTime.now().setZone(TIMEZONE);
+  const day = now.toFormat('yyyy-LL-dd');
+
+  // Ensure today's PDF reflects current store
+    // Ensure escalation PDF reflects current store
+  const store = loadStore(storePath);
+  writeTodayPdf(todayPdf, slug, store.items || []);
+
+  // Copy to both private and public archives (from escalation-qa.pdf)
+  const filename = `${day}-${slug}.pdf`;
+  const srcPdf = todayPdf;
+  const outPrivate = path.join(archive, filename);
+  const outPublic  = path.join(publicArchive, filename);
+  try { fs.copyFileSync(srcPdf, outPrivate); } catch (e) {
+    return res.status(500).json({ ok: false, error: 'copy_private_failed', detail: String(e) });
+  }
+  try { fs.copyFileSync(srcPdf, outPublic); } catch (e) {
+    return res.status(500).json({ ok: false, error: 'copy_public_failed', detail: String(e) });
+  }
+
+  // Reset store and rewrite an empty escalation file
+  saveStore(storePath, { items: [] });
+  writeTodayPdf(todayPdf, slug, store.items || []);
+
+  return res.json({ 
+    ok: true, 
+    slug, 
+    archivedPrivate: path.basename(outPrivate), 
+    archivedPublic: path.basename(outPublic) 
+  });
+});
+
+// ------------ INBOUND (SendGrid Inbound Parse) ------------
+app.post('/inbound', upload.any(), async (req, res) => {
   try {
-    const fields = req.body;
-    const secret = req.query.secret || req.headers['x-inbound-secret'];
+    const DEBUG_INBOUND = DEBUG_INBOUND_ENV || /^(1|true|yes)$/i.test(String(req.query.debug || ''));
 
-    if (DEBUG_INBOUND) {
-      console.log('INBOUND RECEIVED', {
-        to: fields.to || '',
-        cc: fields.cc || '',
-        envelope: fields.envelope || '',
-        subject: fields.subject || ''
-      });
+    // Shared secret — accept header OR query (SendGrid can't add custom headers)
+    if (INBOUND_SECRET) {
+      const h = (req.headers['x-inbound-secret'] || '').toString();
+      const q = (req.query.secret || '').toString();
+      if (h !== INBOUND_SECRET && q !== INBOUND_SECRET) {
+        if (DEBUG_INBOUND) console.warn('Inbound forbidden: bad secret', { hasHeader: Boolean(h), hasQuery: Boolean(q) });
+        return res.status(403).send('forbidden');
+      }
     }
 
-    // Basic validation
-    if (INBOUND_SECRET && secret !== INBOUND_SECRET) {
-      console.warn('Inbound auth failed');
-      return res.status(403).json({ ok: false, error: 'forbidden' });
-    }
+    const fields = Object.fromEntries(Object.entries(req.body || {}));
 
-    let bodyText = fields.text || '';
-    bodyText = bodyText.trim();
+    // Optional override for testing: ?forceSlug=<tenant>
+    const forceSlug = (req.query.forceSlug || '').toString().trim();
+    let derivedSlug = '';
 
-    if (!bodyText) {
-      if (DEBUG_INBOUND) console.warn('No body text in inbound email');
-      return res.status(200).json({ ok: false, error: 'no_body' });
-    }
+    // Prefer plain text; otherwise convert HTML to text (declared 'let' so we can strip the tenant tag)
+    let bodyText =
+      (fields.text && fields.text.trim())
+        ? fields.text
+        : htmlToText(fields.html || '');
 
-    // --- NEW: Multi-tenant tag detection and stripping ---
-    let tagSlug = null;
-    const firstLine = bodyText.split('\n')[0] || '';
-    const tagMatch = firstLine.match(/^\[TENANT:\s*([a-z0-9-_]+)\]/i);
-    if (tagMatch) {
-      tagSlug = tagMatch[1].toLowerCase();
-      if (DEBUG_INBOUND) console.log('Detected tenant tag:', tagSlug);
-    }
+    // Extract tenant tag from the very first line, e.g., "[tenant: serverpartners]"
+    const tagSlug = extractTenantTag(bodyText);
 
-    // --- Derive slug from recipient addresses ---
-    const to = (fields.to || '').toLowerCase();
-    const cc = (fields.cc || '').toLowerCase();
-    const envelope = (fields.envelope || '').toLowerCase();
-
-    const allRecips = [to, cc, envelope].filter(Boolean).join(',');
-    const candidates = [];
-
-    if (/1stanswerbot/i.test(allRecips)) candidates.push('1stanswerbot');
-    if (/serverpartners/i.test(allRecips)) candidates.push('serverpartners');
-
-    let derivedSlug = 'default';
-    if (candidates.length === 1) {
-      derivedSlug = candidates[0];
-    } else if (candidates.length > 1) {
-      if (DEBUG_INBOUND) console.warn('Multiple tenant candidates — cannot auto-select without tag', { candidates });
-      if (!tagSlug) {
+    if (forceSlug) {
+      derivedSlug = forceSlug.toLowerCase().replace(/[^a-z0-9-_]/g, '');
+      if (DEBUG_INBOUND) console.log('FORCED_SLUG', { derivedSlug });
+    } else {
+      const candidates = findQaRepliesCandidates(fields, DEBUG_INBOUND);
+      if (!candidates.length) {
+        if (DEBUG_INBOUND) console.warn('No qa+...@replies... recipient found', { to: fields.to, cc: fields.cc, envelope: fields.envelope });
+        return res.status(200).json({ ok: false, error: 'no_tenant_recipient' });
+      }
+      if (candidates.length > 1) {
+        if (DEBUG_INBOUND) console.warn('Multiple tenant recipients in one email — rejecting to prevent cross-tenant update', { candidates });
         return res.status(200).json({ ok: false, error: 'multiple_tenant_recipients', candidates });
       }
       derivedSlug = deriveSlugFromAddress(candidates[0]);
@@ -538,7 +588,7 @@ app.post('/inbound', upload.none(), async (req, res) => {
       return res.status(200).json({ ok: true, ignored: true, reason: 'tenant_tag_mismatch', tagSlug, derivedSlug });
     }
 
-    // If the tag matches, strip the tag line before parsing so it doesn't appear in PDFs
+    // If the tag matches, strip the tag line before parsing so it doesn’t appear in PDFs
     if (tagSlug) {
       const i = bodyText.indexOf('\n');
       bodyText = (i >= 0 ? bodyText.slice(i + 1) : '').trim();
