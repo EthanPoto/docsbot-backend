@@ -1,4 +1,4 @@
-// server.js — Multi-tenant Q/A store with per-company PDFs + SendGrid inbound
+/// server.js — Multi-tenant Q/A store with per-company PDFs + SendGrid inbound
 console.log('BOOT', { cwd: process.cwd(), node: process.version });
 
 const express = require('express');
@@ -393,6 +393,53 @@ function extractTenantTag(s) {
 function parseQAOrAnswerOnly(raw = '') {
   const t = String(raw || '');
 
+  // Check for numbered Q&A format (Q1:, Q2:, Q3: with optional A1:, A2:, A3:)
+  const numberedQMatches = t.match(/Q(\d+)\s*[:\-–]\s*([^\n]+)/gi);
+  
+  if (numberedQMatches && numberedQMatches.length > 0) {
+    // Extract all numbered questions
+    const questions = [];
+    const answers = [];
+    
+    // Parse questions
+    numberedQMatches.forEach(match => {
+      const qMatch = match.match(/Q(\d+)\s*[:\-–]\s*(.+)/i);
+      if (qMatch) {
+        const num = parseInt(qMatch[1]);
+        const question = qMatch[2].trim();
+        questions[num - 1] = question;
+      }
+    });
+    
+    // Parse answers (if any)
+    const numberedAMatches = t.match(/A(\d+)\s*[:\-–]\s*([^\n]+)/gi);
+    if (numberedAMatches) {
+      numberedAMatches.forEach(match => {
+        const aMatch = match.match(/A(\d+)\s*[:\-–]\s*(.+)/i);
+        if (aMatch) {
+          const num = parseInt(aMatch[1]);
+          let answerText = aMatch[2].trim();
+          
+          // Cut at email signatures/quotes (same logic as original)
+          const cutAt = answerText.search(/^\s*(Q\d+\s*[:\-–]|On .* wrote:|From:|Sent:|-----|>)/im);
+          if (cutAt > -1) answerText = answerText.slice(0, cutAt).trim();
+          
+          answers[num - 1] = answerText;
+        }
+      });
+    }
+    
+    // Return array format
+    return {
+      mode: 'NUMBERED_QA',
+      items: questions.map((q, idx) => ({
+        q: q || '',
+        a: answers[idx] || ''
+      })).filter(item => item.q) // Only include items with questions
+    };
+  }
+
+  // Original Q: and A: logic (unchanged)
   // Slightly more forgiving Q: pattern (Q: / Q- / Q – )
   const qMatch = t.match(/^\s*Q\s*[:\-–]\s*(.+)$/im);
 
@@ -606,8 +653,54 @@ app.post('/inbound', upload.any(), async (req, res) => {
     const store = loadStore(storePath);
 
     let resultMode = parsed.mode;
+    let addedCount = 0;
 
-    if (parsed.mode === 'QA') {
+    // Handle numbered Q&A format (Q1:, Q2:, Q3: with A1:, A2:, A3:)
+    if (parsed.mode === 'NUMBERED_QA') {
+      parsed.items.forEach((item, idx) => {
+        if (!item.q) return; // Skip empty questions
+        
+        if (item.a) {
+          // Has both question and answer - try to match existing pending or create new answered
+          let matched = false;
+          for (let i = store.items.length - 1; i >= 0; i--) {
+            const it = store.items[i];
+            if (isPendingItem(it) && norm(it.q) === norm(item.q)) {
+              it.a = item.a;
+              it.status = 'answered';
+              it.answeredTs = Date.now();
+              matched = true;
+              addedCount++;
+              break;
+            }
+          }
+          if (!matched) {
+            // Create new answered item
+            store.items.push({
+              q: item.q,
+              a: item.a,
+              status: 'answered',
+              ts: Date.now(),
+              source: 'email'
+            });
+            addedCount++;
+          }
+        } else {
+          // Question only - create pending
+          store.items.push({
+            q: item.q,
+            a: '',
+            status: 'pending',
+            ts: Date.now(),
+            source: 'email'
+          });
+          addedCount++;
+        }
+      });
+      resultMode = `NUMBERED_QA->processed_${addedCount}_items`;
+    }
+    // Original single Q:/A: logic (unchanged)
+    else if (parsed.mode === 'QA') {
       // Try to close a matching pending by question; else add answered
       let matched = false;
       for (let i = store.items.length - 1; i >= 0; i--) {
@@ -631,6 +724,7 @@ app.post('/inbound', upload.any(), async (req, res) => {
         });
         resultMode = 'QA->created_new';
       }
+      addedCount = 1;
     } else if (parsed.mode === 'Q') {
       store.items.push({
         q: parsed.q,
@@ -639,6 +733,7 @@ app.post('/inbound', upload.any(), async (req, res) => {
         ts: Date.now(),
         source: 'email'
       });
+      addedCount = 1;
     } else if (parsed.mode === 'A') {
       // Fill most recent pending item
       let updated = false;
@@ -665,6 +760,7 @@ app.post('/inbound', upload.any(), async (req, res) => {
         });
         resultMode = 'A->no_pending_created_new';
       }
+      addedCount = 1;
     }
 
     
@@ -696,7 +792,7 @@ app.post('/inbound', upload.any(), async (req, res) => {
     }
 
     const anyPending = store.items.some(it => (!it.a || !String(it.a).trim()));
-    return res.status(200).json({ ok: true, slug, mode: resultMode, pending: anyPending, added: 1 });
+    return res.status(200).json({ ok: true, slug, mode: resultMode, pending: anyPending, added: addedCount });
   } catch (err) {
     console.error('Inbound error:', err);
     return res.status(200).json({ ok: false, error: 'inbound exception' });
