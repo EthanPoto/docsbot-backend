@@ -393,6 +393,61 @@ function extractTenantTag(s) {
 function parseQAOrAnswerOnly(raw = '') {
   const t = String(raw || '');
 
+  // Check for numbered answers WITHOUT questions (A1:, A2:, A3: only)
+  const answersOnlyMatches = t.match(/A(\d+)\s*[:\-–]/gi);
+  const questionsExist = /Q(\d+)\s*[:\-–]/i.test(t);
+  
+  if (answersOnlyMatches && answersOnlyMatches.length > 0 && !questionsExist) {
+    // This is an answer-only email (rep replying to pending questions)
+    const answers = [];
+    const lines = t.split('\n');
+    let currentAnswerNum = null;
+    let currentAnswerText = '';
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const aMatch = line.match(/^\s*A(\d+)\s*[:\-–]\s*(.*)$/i);
+      
+      if (aMatch) {
+        // Save previous answer if exists
+        if (currentAnswerNum !== null && currentAnswerText) {
+          answers[currentAnswerNum - 1] = currentAnswerText.trim();
+        }
+        
+        // Start new answer
+        currentAnswerNum = parseInt(aMatch[1]);
+        currentAnswerText = aMatch[2].trim();
+      } else if (currentAnswerNum !== null) {
+        // Check if this line is part of the current answer
+        if (!/^\s*A\d+\s*[:\-–]/i.test(line) && 
+            !/^\s*(On .* wrote:|From:|Sent:|-----|>)/i.test(line)) {
+          const trimmedLine = line.trim();
+          if (trimmedLine) {
+            currentAnswerText += ' ' + trimmedLine;
+          }
+        } else {
+          // Hit a delimiter, save current answer and stop
+          if (currentAnswerText) {
+            answers[currentAnswerNum - 1] = currentAnswerText.trim();
+          }
+          currentAnswerNum = null;
+          currentAnswerText = '';
+        }
+      }
+    }
+    
+    // Save last answer if exists
+    if (currentAnswerNum !== null && currentAnswerText) {
+      answers[currentAnswerNum - 1] = currentAnswerText.trim();
+    }
+    
+    // Return as NUMBERED_ANSWERS_ONLY mode
+    return {
+      mode: 'NUMBERED_ANSWERS_ONLY',
+      answers: answers.filter(a => a) // Remove empty slots
+    };
+  }
+
   // Check for numbered Q&A format (Q1:, Q2:, Q3: with optional A1:, A2:, A3:)
   const numberedQMatches = t.match(/Q(\d+)\s*[:\-–]\s*([^\n]+)/gi);
   
@@ -666,7 +721,51 @@ app.post('/inbound', upload.any(), async (req, res) => {
     }
 
     const parsed = parseQAOrAnswerOnly(bodyText);
-    if (DEBUG_INBOUND) console.log('INBOUND PARSED', { slug: derivedSlug, mode: parsed.mode, hasQ: !!parsed.q, hasA: !!parsed.a });
+    
+    // ENHANCED DEBUG LOGGING
+    console.log('========== INBOUND PARSING DEBUG ==========');
+    console.log('Raw bodyText:', bodyText.substring(0, 300));
+    console.log('Parsed mode:', parsed.mode);
+    if (parsed.mode === 'NUMBERED_QA') {
+      console.log('NUMBERED_QA detected!');
+      console.log('Items:', JSON.stringify(parsed.items, null, 2));
+    } else {
+      console.log('Single Q/A - hasQ:', !!parsed.q, 'hasA:', !!parsed.a);
+    }
+    // Strip quoted/forwarded email content before parsing
+    // Look for common email delimiters and cut there
+    let cleanBodyText = bodyText;
+    const quotePatterns = [
+      /^On .+ wrote:/im,
+      /^From:/im,
+      /^Sent:/im,
+      /^_{5,}/m,  // Underscores
+      /^-{5,}/m,  // Dashes
+      /^>{1,}/m   // Quote markers
+    ];
+    
+    for (const pattern of quotePatterns) {
+      const match = cleanBodyText.match(pattern);
+      if (match && match.index) {
+        cleanBodyText = cleanBodyText.slice(0, match.index).trim();
+        break;
+      }
+    }
+    
+    console.log('==========================================');
+    console.log('BODY TEXT (before cleaning):', bodyText.slice(0, 200));
+    console.log('BODY TEXT (after cleaning):', cleanBodyText.slice(0, 200));
+    console.log('==========================================');
+    
+    const parsed = parseQAOrAnswerOnly(cleanBodyText);
+    if (DEBUG_INBOUND) console.log('INBOUND PARSED', { 
+      slug: derivedSlug, 
+      mode: parsed.mode, 
+      hasQ: !!parsed.q, 
+      hasA: !!parsed.a,
+      answersCount: parsed.answers ? parsed.answers.length : 0,
+      itemsCount: parsed.items ? parsed.items.length : 0
+    });
 
     if (parsed.mode === 'NONE') {
       if (DEBUG_INBOUND) console.warn('Inbound parse failed (no Q:/A:)', { derivedSlug, sample: bodyText.slice(0, 200) });
@@ -679,8 +778,31 @@ app.post('/inbound', upload.any(), async (req, res) => {
     let resultMode = parsed.mode;
     let addedCount = 0;
 
+    // Handle numbered answers WITHOUT questions (rep replying to pending questions)
+    if (parsed.mode === 'NUMBERED_ANSWERS_ONLY') {
+      // Find the most recent pending questions and fill them in order
+      const pendingItems = [];
+      for (let i = store.items.length - 1; i >= 0 && pendingItems.length < parsed.answers.length; i--) {
+        const it = store.items[i];
+        if (isPendingItem(it)) {
+          pendingItems.unshift({ item: it, index: i });
+        }
+      }
+      
+      // Match answers to pending questions in order
+      parsed.answers.forEach((answer, idx) => {
+        if (pendingItems[idx]) {
+          pendingItems[idx].item.a = answer;
+          pendingItems[idx].item.status = 'answered';
+          pendingItems[idx].item.answeredTs = Date.now();
+          addedCount++;
+        }
+      });
+      
+      resultMode = `NUMBERED_ANSWERS_ONLY->filled_${addedCount}_pending`;
+    }
     // Handle numbered Q&A format (Q1:, Q2:, Q3: with A1:, A2:, A3:)
-    if (parsed.mode === 'NUMBERED_QA') {
+    else if (parsed.mode === 'NUMBERED_QA') {
       parsed.items.forEach((item, idx) => {
         if (!item.q) return; // Skip empty questions
         
