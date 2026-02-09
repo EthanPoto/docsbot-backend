@@ -1,4 +1,4 @@
-/// server.js — Multi-tenant Q/A store with per-company PDFs + SendGrid inbound
+// server.js — Multi-tenant Q/A store with per-company PDFs + SendGrid inbound
 console.log('BOOT', { cwd: process.cwd(), node: process.version });
 
 const express = require('express');
@@ -411,22 +411,46 @@ function parseQAOrAnswerOnly(raw = '') {
       }
     });
     
-    // Parse answers (if any)
-    const numberedAMatches = t.match(/A(\d+)\s*[:\-–]\s*([^\n]+)/gi);
-    if (numberedAMatches) {
-      numberedAMatches.forEach(match => {
-        const aMatch = match.match(/A(\d+)\s*[:\-–]\s*(.+)/i);
-        if (aMatch) {
-          const num = parseInt(aMatch[1]);
-          let answerText = aMatch[2].trim();
-          
-          // Cut at email signatures/quotes (same logic as original)
-          const cutAt = answerText.search(/^\s*(Q\d+\s*[:\-–]|On .* wrote:|From:|Sent:|-----|>)/im);
-          if (cutAt > -1) answerText = answerText.slice(0, cutAt).trim();
-          
-          answers[num - 1] = answerText;
+    // Parse answers (if any) - handle multi-line answers
+    const lines = t.split('\n');
+    let currentAnswerNum = null;
+    let currentAnswerText = '';
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const aMatch = line.match(/^\s*A(\d+)\s*[:\-–]\s*(.*)$/i);
+      
+      if (aMatch) {
+        // Save previous answer if exists
+        if (currentAnswerNum !== null && currentAnswerText) {
+          answers[currentAnswerNum - 1] = currentAnswerText.trim();
         }
-      });
+        
+        // Start new answer
+        currentAnswerNum = parseInt(aMatch[1]);
+        currentAnswerText = aMatch[2].trim();
+      } else if (currentAnswerNum !== null) {
+        // Check if this line is part of the current answer (not a new Q or A, not email signature)
+        if (!/^\s*(Q\d+|A\d+)\s*[:\-–]/i.test(line) && 
+            !/^\s*(On .* wrote:|From:|Sent:|-----|>)/i.test(line)) {
+          const trimmedLine = line.trim();
+          if (trimmedLine) {
+            currentAnswerText += ' ' + trimmedLine;
+          }
+        } else {
+          // Hit a delimiter, save current answer and stop
+          if (currentAnswerText) {
+            answers[currentAnswerNum - 1] = currentAnswerText.trim();
+          }
+          currentAnswerNum = null;
+          currentAnswerText = '';
+        }
+      }
+    }
+    
+    // Save last answer if exists
+    if (currentAnswerNum !== null && currentAnswerText) {
+      answers[currentAnswerNum - 1] = currentAnswerText.trim();
     }
     
     // Return array format
