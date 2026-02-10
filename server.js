@@ -1058,3 +1058,4 @@ app.listen(PORT, () => {
 // Graceful-ish error logs
 process.on('unhandledRejection', err => console.error('UNHANDLED REJECTION', err));
 process.on('uncaughtException', err => console.error('UNCAUGHT EXCEPTION', err));
+}
