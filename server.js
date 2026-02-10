@@ -478,6 +478,11 @@ app.get('/c/:slug/api/status', (req, res) => {
 app.get('/c/:slug/api/peek', (req, res) => {
   const raw = (req.params.slug || '').toLowerCase();
   const limit = Math.max(1, Math.min(50, parseInt(req.query.limit || '5', 10)));
+  const { storePath } = slugDirs(raw);
+  const store = loadStore(storePath);
+  const items = store.items.slice(-limit);
+  res.json({ slug: raw, count: store.items.length, last: items });
+});
 
 // ------------ TEST CLEANUP (MANUAL TRIGGER) ------------
 app.get('/c/:slug/api/test-cleanup', (req, res) => {
@@ -522,11 +527,6 @@ app.get('/c/:slug/api/test-cleanup', (req, res) => {
     after,
     message: `Cleanup complete. Kept ${after.answered} answered forever, ${after.pending} pending (< 7 days). Removed ${after.removed} old pending.`
   });
-});
-  const { storePath } = slugDirs(raw);
-  const store = loadStore(storePath);
-  const items = store.items.slice(-limit);
-  res.json({ slug: raw, count: store.items.length, last: items });
 });
 
 // ---------- ARCHIVES: LIST + DOWNLOAD + MANUAL ROLLOVER ----------
