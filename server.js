@@ -809,9 +809,20 @@ try {
 }
 console.log('Archived PDF', { slug, private: path.join(archive, filename), public: path.join(publicArchive, filename) });
 
-// reset store and rewrite an empty escalation file
-saveStore(storePath, { items: [] });
-writeTodayPdf(todayPdf, slug, []);
+// Keep answered questions forever, clear pending older than 7 days
+const sevenDays = 7 * 24 * 60 * 60 * 1000;
+const keepItems = store.items.filter(it => {
+  // Keep all answered questions forever
+  if (it.a && String(it.a).trim()) return true;
+  
+  // Keep pending questions less than 7 days old
+  const age = Date.now() - (it.ts || 0);
+  return age < sevenDays;
+});
+
+saveStore(storePath, { items: keepItems });
+writeTodayPdf(todayPdf, slug, keepItems);
+console.log(`📚 Knowledge retained: ${keepItems.filter(it => it.a).length} answered, ${keepItems.filter(it => !it.a || !String(it.a).trim()).length} pending`);
 
 
 
