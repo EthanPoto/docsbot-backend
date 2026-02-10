@@ -206,63 +206,80 @@ function writeTodayPdf(pdfPath, slug, items = []) {
   if (!Array.isArray(items)) items = [];
 
   // Make sure directory exists for PDF output
-  const publicSlug = path.dirname(pdfPath);
-  fs.mkdirSync(publicSlug, { recursive: true });
+  const dir = path.dirname(pdfPath);
+  fs.mkdirSync(dir, { recursive: true });
 
+  return new Promise((resolve, reject) => {
+    try {
+      const doc = new PDFDocument({ size: "LETTER", margin: 40 });
+      const chunks = [];
+      
+      // Collect PDF data in memory
+      doc.on('data', chunk => chunks.push(chunk));
+      doc.on('end', () => {
+        try {
+          // Write buffer to file
+          const pdfBuffer = Buffer.concat(chunks);
+          fs.writeFileSync(pdfPath, pdfBuffer);
 
-  const doc = new PDFDocument({ size: "LETTER", margin: 40 });
-  const tmp = pdfPath + ".tmp";
-  const stream = fs.createWriteStream(tmp);
-  doc.pipe(stream);
+          // Desktop mirror (Mac only)
+          if (process.platform === "darwin") {
+            try {
+              const pdfName = path.basename(pdfPath);
+              const destDir = path.join("/Users/ethanpoto/Desktop/docsbot-backend", slug);
+              fs.mkdirSync(destDir, { recursive: true });
+              fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
+              console.log(`🖥️  Local copy saved for ${slug}`);
+            } catch (mirrorErr) {
+              console.warn("⚠️  Desktop mirror skipped:", mirrorErr.message);
+            }
+          }
 
-  const ts = DateTime.now().setZone(TIMEZONE).toFormat("yyyy-LL-dd HH:mm");
-  const company = displayNameFromSlug(slug);
+          console.log(`✅ PDF updated for ${slug}: ${pdfPath}`);
+          resolve();
+        } catch (writeErr) {
+          console.error(`❌ PDF save error:`, writeErr);
+          reject(writeErr);
+        }
+      });
+      
+      doc.on('error', err => {
+        console.error(`❌ PDF generation error:`, err);
+        reject(err);
+      });
 
-  doc.fontSize(18).text(`Escalation Q/A — ${company}`, { underline: true });
-  doc.moveDown(0.25);
-  doc.fontSize(10).text(`Generated: ${ts} ${TIMEZONE}`);
-  doc.moveDown();
+      const ts = DateTime.now().setZone(TIMEZONE).toFormat("yyyy-LL-dd HH:mm");
+      const company = displayNameFromSlug(slug);
 
-    if (!items.length) {
-    doc.fontSize(12).text("No entries yet.");
-  } else {
-    items.forEach((it, i) => {
-      doc.moveDown(0.5);
-      doc.fontSize(13).text(`${i + 1}. Q: ${it.q}`);
+      doc.fontSize(18).text(`Escalation Q/A — ${company}`, { underline: true });
+      doc.moveDown(0.25);
+      doc.fontSize(10).text(`Generated: ${ts} ${TIMEZONE}`);
+      doc.moveDown();
 
-      if (it.a && String(it.a).trim()) {
-        doc.moveDown(0.2);
-        doc.fontSize(12).text(`   A: ${it.a}`);
+      if (!items.length) {
+        doc.fontSize(12).text("No entries yet.");
+      } else {
+        items.forEach((it, i) => {
+          doc.moveDown(0.5);
+          doc.fontSize(13).text(`${i + 1}. Q: ${it.q}`);
+
+          if (it.a && String(it.a).trim()) {
+            doc.moveDown(0.2);
+            doc.fontSize(12).text(`   A: ${it.a}`);
+          }
+
+          doc.moveDown(0.4);
+          doc.moveTo(40, doc.y).lineTo(550, doc.y).stroke();
+        });
       }
 
-      doc.moveDown(0.4);
-      doc.moveTo(40, doc.y).lineTo(550, doc.y).stroke();
-    });
-  }
-
-  doc.end();
-  
-    return new Promise((resolve, reject) => {
-    stream.on("finish", () => {
-      try {
-        // rename temp file to final
-        fs.mkdirSync(path.dirname(pdfPath), { recursive: true });
-        fs.renameSync(tmp, pdfPath);
-
-        if (process.platform === "darwin") {
-          try {
-            const pdfName = path.basename(pdfPath);
-            const destDir = path.join("/Users/ethanpoto/Desktop/docsbot-backend", slug);
-            fs.mkdirSync(destDir, { recursive: true });
-            fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
-            console.log(`🖥️  Local copy saved for ${slug}`);
-          } catch (mirrorErr) {
-            console.warn("⚠️  Desktop mirror skipped:", mirrorErr.message);
-          }
-        }
-
-        console.log(`✅ PDF updated for ${slug}: ${pdfPath}`);
-        resolve();
+      doc.end();
+    } catch (err) {
+      console.error(`❌ PDF creation error:`, err);
+      reject(err);
+    }
+  });
+}
       } catch (err) {
         console.error("❌ PDF save error:", err);
         reject(err);
@@ -732,40 +749,9 @@ app.post('/inbound', upload.any(), async (req, res) => {
     } else {
       console.log('Single Q/A - hasQ:', !!parsed.q, 'hasA:', !!parsed.a);
     }
-    // Strip quoted/forwarded email content before parsing
-    // Look for common email delimiters and cut there
-    let cleanBodyText = bodyText;
-    const quotePatterns = [
-      /^On .+ wrote:/im,
-      /^From:/im,
-      /^Sent:/im,
-      /^_{5,}/m,  // Underscores
-      /^-{5,}/m,  // Dashes
-      /^>{1,}/m   // Quote markers
-    ];
-    
-    for (const pattern of quotePatterns) {
-      const match = cleanBodyText.match(pattern);
-      if (match && match.index) {
-        cleanBodyText = cleanBodyText.slice(0, match.index).trim();
-        break;
-      }
-    }
-    
-    console.log('==========================================');
-    console.log('BODY TEXT (before cleaning):', bodyText.slice(0, 200));
-    console.log('BODY TEXT (after cleaning):', cleanBodyText.slice(0, 200));
     console.log('==========================================');
     
-    const parsed = parseQAOrAnswerOnly(cleanBodyText);
-    if (DEBUG_INBOUND) console.log('INBOUND PARSED', { 
-      slug: derivedSlug, 
-      mode: parsed.mode, 
-      hasQ: !!parsed.q, 
-      hasA: !!parsed.a,
-      answersCount: parsed.answers ? parsed.answers.length : 0,
-      itemsCount: parsed.items ? parsed.items.length : 0
-    });
+    if (DEBUG_INBOUND) console.log('INBOUND PARSED', { slug: derivedSlug, mode: parsed.mode, hasQ: !!parsed.q, hasA: !!parsed.a });
 
     if (parsed.mode === 'NONE') {
       if (DEBUG_INBOUND) console.warn('Inbound parse failed (no Q:/A:)', { derivedSlug, sample: bodyText.slice(0, 200) });
