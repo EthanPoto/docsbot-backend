@@ -759,25 +759,35 @@ app.post('/inbound', upload.any(), async (req, res) => {
 
     // Handle numbered answers WITHOUT questions (rep replying to pending questions)
     if (parsed.mode === 'NUMBERED_ANSWERS_ONLY') {
+      console.log('📧 NUMBERED_ANSWERS_ONLY detected!');
+      console.log('Answers received:', parsed.answers);
+      
       // Find the most recent pending questions and fill them in order
       const pendingItems = [];
       for (let i = store.items.length - 1; i >= 0 && pendingItems.length < parsed.answers.length; i--) {
         const it = store.items[i];
         if (isPendingItem(it)) {
           pendingItems.unshift({ item: it, index: i });
+          console.log(`Found pending item #${i}: "${it.q}"`);
         }
       }
+      
+      console.log(`Found ${pendingItems.length} pending items for ${parsed.answers.length} answers`);
       
       // Match answers to pending questions in order
       parsed.answers.forEach((answer, idx) => {
         if (pendingItems[idx]) {
+          console.log(`Filling pending Q: "${pendingItems[idx].item.q}" with A: "${answer}"`);
           pendingItems[idx].item.a = answer;
           pendingItems[idx].item.status = 'answered';
           pendingItems[idx].item.answeredTs = Date.now();
           addedCount++;
+        } else {
+          console.log(`⚠️ No pending question for answer #${idx + 1}: "${answer}"`);
         }
       });
       
+      console.log(`✅ Filled ${addedCount} pending questions with answers`);
       resultMode = `NUMBERED_ANSWERS_ONLY->filled_${addedCount}_pending`;
     }
     // Handle numbered Q&A format (Q1:, Q2:, Q3: with A1:, A2:, A3:)
