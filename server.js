@@ -423,10 +423,11 @@ function parseQAOrAnswerOnly(raw = '') {
     
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
-      const aMatch = line.match(/^\s*A(\d+)\s*[:\-–]\s*(.*)$/i);
+      console.log(`  Line ${i}: "${line}" (length: ${line.length})`);
+      const aMatch = line.match(/A(\d+)\s*:\s*(.+)/i);
       
       if (aMatch) {
-        console.log(`  Line ${i}: Matched A${aMatch[1]}: "${aMatch[2]}"`);
+        console.log(`  ✅ Line ${i}: Matched A${aMatch[1]}: "${aMatch[2]}"`);
         // Save previous answer if exists
         if (currentAnswerNum !== null && currentAnswerText) {
           answers[currentAnswerNum - 1] = currentAnswerText.trim();
@@ -436,7 +437,9 @@ function parseQAOrAnswerOnly(raw = '') {
         // Start new answer
         currentAnswerNum = parseInt(aMatch[1]);
         currentAnswerText = aMatch[2].trim();
-      } else if (currentAnswerNum !== null) {
+      } else {
+        console.log(`  ❌ Line ${i}: No match`);
+        if (currentAnswerNum !== null) {
         // Check if this line is part of the current answer
         if (!/^\s*A\d+\s*[:\-–]/i.test(line) && 
             !/^\s*(On .* wrote:|From:|Sent:|-----|>)/i.test(line)) {
