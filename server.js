@@ -407,10 +407,17 @@ function parseQAOrAnswerOnly(raw = '') {
   const answersOnlyMatches = t.match(/A(\d+)\s*[:\-–]/gi);
   const questionsExist = /Q(\d+)\s*[:\-–]/i.test(t);
   
+  console.log('🔍 Parser checking for NUMBERED_ANSWERS_ONLY:');
+  console.log('  answersOnlyMatches:', answersOnlyMatches);
+  console.log('  questionsExist:', questionsExist);
+  console.log('  Raw text:', t.substring(0, 200));
+  
   if (answersOnlyMatches && answersOnlyMatches.length > 0 && !questionsExist) {
+    console.log('✅ Entering NUMBERED_ANSWERS_ONLY parsing...');
     // This is an answer-only email (rep replying to pending questions)
     const answers = [];
     const lines = t.split('\n');
+    console.log('  Total lines:', lines.length);
     let currentAnswerNum = null;
     let currentAnswerText = '';
     
@@ -419,9 +426,11 @@ function parseQAOrAnswerOnly(raw = '') {
       const aMatch = line.match(/^\s*A(\d+)\s*[:\-–]\s*(.*)$/i);
       
       if (aMatch) {
+        console.log(`  Line ${i}: Matched A${aMatch[1]}: "${aMatch[2]}"`);
         // Save previous answer if exists
         if (currentAnswerNum !== null && currentAnswerText) {
           answers[currentAnswerNum - 1] = currentAnswerText.trim();
+          console.log(`  Saved answer ${currentAnswerNum}: "${currentAnswerText.trim()}"`);
         }
         
         // Start new answer
@@ -439,6 +448,7 @@ function parseQAOrAnswerOnly(raw = '') {
           // Hit a delimiter, save current answer and stop
           if (currentAnswerText) {
             answers[currentAnswerNum - 1] = currentAnswerText.trim();
+            console.log(`  Saved answer ${currentAnswerNum} (delimiter): "${currentAnswerText.trim()}"`);
           }
           currentAnswerNum = null;
           currentAnswerText = '';
@@ -449,7 +459,10 @@ function parseQAOrAnswerOnly(raw = '') {
     // Save last answer if exists
     if (currentAnswerNum !== null && currentAnswerText) {
       answers[currentAnswerNum - 1] = currentAnswerText.trim();
+      console.log(`  Saved last answer ${currentAnswerNum}: "${currentAnswerText.trim()}"`);
     }
+    
+    console.log('  Final answers array:', answers);
     
     // Return as NUMBERED_ANSWERS_ONLY mode
     return {
