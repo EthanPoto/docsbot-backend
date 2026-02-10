@@ -478,6 +478,51 @@ app.get('/c/:slug/api/status', (req, res) => {
 app.get('/c/:slug/api/peek', (req, res) => {
   const raw = (req.params.slug || '').toLowerCase();
   const limit = Math.max(1, Math.min(50, parseInt(req.query.limit || '5', 10)));
+
+// ------------ TEST CLEANUP (MANUAL TRIGGER) ------------
+app.get('/c/:slug/api/test-cleanup', (req, res) => {
+  const raw = (req.params.slug || '').toLowerCase();
+  if (!raw) return res.status(400).json({ error: 'missing slug' });
+  
+  const { storePath, todayPdf, slug } = slugDirs(raw);
+  const store = loadStore(storePath);
+  
+  const before = {
+    total: store.items.length,
+    answered: store.items.filter(it => it.a && String(it.a).trim()).length,
+    pending: store.items.filter(it => !it.a || !String(it.a).trim()).length
+  };
+  
+  // Apply the same logic as nightly cleanup
+  const sevenDays = 7 * 24 * 60 * 60 * 1000;
+  const keepItems = store.items.filter(it => {
+    // Keep all answered questions forever
+    if (it.a && String(it.a).trim()) return true;
+    
+    // Keep pending questions less than 7 days old
+    const age = Date.now() - (it.ts || 0);
+    return age < sevenDays;
+  });
+  
+  const after = {
+    total: keepItems.length,
+    answered: keepItems.filter(it => it.a && String(it.a).trim()).length,
+    pending: keepItems.filter(it => !it.a || !String(it.a).trim()).length,
+    removed: store.items.length - keepItems.length
+  };
+  
+  // Save the filtered store
+  saveStore(storePath, { items: keepItems });
+  writeTodayPdf(todayPdf, slug, keepItems);
+  
+  res.json({ 
+    ok: true, 
+    slug, 
+    before, 
+    after,
+    message: `Cleanup complete. Kept ${after.answered} answered forever, ${after.pending} pending (< 7 days). Removed ${after.removed} old pending.`
+  });
+});
   const { storePath } = slugDirs(raw);
   const store = loadStore(storePath);
   const items = store.items.slice(-limit);
