@@ -206,80 +206,70 @@ function writeTodayPdf(pdfPath, slug, items = []) {
   if (!Array.isArray(items)) items = [];
 
   // Make sure directory exists for PDF output
-  const dir = path.dirname(pdfPath);
-  fs.mkdirSync(dir, { recursive: true });
+  const publicSlug = path.dirname(pdfPath);
+  fs.mkdirSync(publicSlug, { recursive: true });
 
-  return new Promise((resolve, reject) => {
-    try {
-      const doc = new PDFDocument({ size: "LETTER", margin: 40 });
-      const chunks = [];
-      
-      // Collect PDF data in memory
-      doc.on('data', chunk => chunks.push(chunk));
-      doc.on('end', () => {
-        try {
-          // Write buffer to file
-          const pdfBuffer = Buffer.concat(chunks);
-          fs.writeFileSync(pdfPath, pdfBuffer);
 
-          // Desktop mirror (Mac only)
-          if (process.platform === "darwin") {
-            try {
-              const pdfName = path.basename(pdfPath);
-              const destDir = path.join("/Users/ethanpoto/Desktop/docsbot-backend", slug);
-              fs.mkdirSync(destDir, { recursive: true });
-              fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
-              console.log(`🖥️  Local copy saved for ${slug}`);
-            } catch (mirrorErr) {
-              console.warn("⚠️  Desktop mirror skipped:", mirrorErr.message);
-            }
-          }
+  const doc = new PDFDocument({ size: "LETTER", margin: 40 });
+  const tmp = pdfPath + ".tmp";
+  const stream = fs.createWriteStream(tmp);
+  doc.pipe(stream);
 
-          console.log(`✅ PDF updated for ${slug}: ${pdfPath}`);
-          resolve();
-        } catch (writeErr) {
-          console.error(`❌ PDF save error:`, writeErr);
-          reject(writeErr);
-        }
-      });
-      
-      doc.on('error', err => {
-        console.error(`❌ PDF generation error:`, err);
-        reject(err);
-      });
+  const ts = DateTime.now().setZone(TIMEZONE).toFormat("yyyy-LL-dd HH:mm");
+  const company = displayNameFromSlug(slug);
 
-      const ts = DateTime.now().setZone(TIMEZONE).toFormat("yyyy-LL-dd HH:mm");
-      const company = displayNameFromSlug(slug);
+  doc.fontSize(18).text(`Escalation Q/A — ${company}`, { underline: true });
+  doc.moveDown(0.25);
+  doc.fontSize(10).text(`Generated: ${ts} ${TIMEZONE}`);
+  doc.moveDown();
 
-      doc.fontSize(18).text(`Escalation Q/A — ${company}`, { underline: true });
-      doc.moveDown(0.25);
-      doc.fontSize(10).text(`Generated: ${ts} ${TIMEZONE}`);
-      doc.moveDown();
+    if (!items.length) {
+    doc.fontSize(12).text("No entries yet.");
+  } else {
+    items.forEach((it, i) => {
+      doc.moveDown(0.5);
+      doc.fontSize(13).text(`${i + 1}. Q: ${it.q}`);
 
-      if (!items.length) {
-        doc.fontSize(12).text("No entries yet.");
-      } else {
-        items.forEach((it, i) => {
-          doc.moveDown(0.5);
-          doc.fontSize(13).text(`${i + 1}. Q: ${it.q}`);
-
-          if (it.a && String(it.a).trim()) {
-            doc.moveDown(0.2);
-            doc.fontSize(12).text(`   A: ${it.a}`);
-          }
-
-          doc.moveDown(0.4);
-          doc.moveTo(40, doc.y).lineTo(550, doc.y).stroke();
-        });
+      if (it.a && String(it.a).trim()) {
+        doc.moveDown(0.2);
+        doc.fontSize(12).text(`   A: ${it.a}`);
       }
 
-      doc.end();
-    } catch (err) {
-      console.error(`❌ PDF creation error:`, err);
-      reject(err);
-    }
+      doc.moveDown(0.4);
+      doc.moveTo(40, doc.y).lineTo(550, doc.y).stroke();
+    });
+  }
+
+  doc.end();
+  
+    return new Promise((resolve, reject) => {
+    stream.on("finish", () => {
+      try {
+        // rename temp file to final
+        fs.mkdirSync(path.dirname(pdfPath), { recursive: true });
+        fs.renameSync(tmp, pdfPath);
+
+        if (process.platform === "darwin") {
+          try {
+            const pdfName = path.basename(pdfPath);
+            const destDir = path.join("/Users/ethanpoto/Desktop/docsbot-backend", slug);
+            fs.mkdirSync(destDir, { recursive: true });
+            fs.copyFileSync(pdfPath, path.join(destDir, pdfName));
+            console.log(`🖥️  Local copy saved for ${slug}`);
+          } catch (mirrorErr) {
+            console.warn("⚠️  Desktop mirror skipped:", mirrorErr.message);
+          }
+        }
+
+        console.log(`✅ PDF updated for ${slug}: ${pdfPath}`);
+        resolve();
+      } catch (err) {
+        console.error("❌ PDF save error:", err);
+        reject(err);
+      }
+    });
   });
-}
+} 
 
 
   
@@ -403,148 +393,6 @@ function extractTenantTag(s) {
 function parseQAOrAnswerOnly(raw = '') {
   const t = String(raw || '');
 
-  // Check for numbered answers WITHOUT questions (A1:, A2:, A3: only)
-  const answersOnlyMatches = t.match(/A(\d+)\s*[:\-–]/gi);
-  const questionsExist = /Q(\d+)\s*[:\-–]/i.test(t);
-  
-  console.log('🔍 Parser checking for NUMBERED_ANSWERS_ONLY:');
-  console.log('  answersOnlyMatches:', answersOnlyMatches);
-  console.log('  questionsExist:', questionsExist);
-  console.log('  Raw text:', t.substring(0, 200));
-  
-  if (answersOnlyMatches && answersOnlyMatches.length > 0 && !questionsExist) {
-    console.log('✅ Entering NUMBERED_ANSWERS_ONLY parsing...');
-    // This is an answer-only email (rep replying to pending questions)
-    const answers = [];
-    const lines = t.split('\n');
-    console.log('  Total lines:', lines.length);
-    let currentAnswerNum = null;
-    let currentAnswerText = '';
-    
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      console.log(`  Line ${i}: "${line}" (length: ${line.length})`);
-      const aMatch = line.match(/A(\d+)\s*:\s*(.+)/i);
-      
-      if (aMatch) {
-        console.log(`  ✅ Line ${i}: Matched A${aMatch[1]}: "${aMatch[2]}"`);
-        // Save previous answer if exists
-        if (currentAnswerNum !== null && currentAnswerText) {
-          answers[currentAnswerNum - 1] = currentAnswerText.trim();
-          console.log(`  Saved answer ${currentAnswerNum}: "${currentAnswerText.trim()}"`);
-        }
-        
-        // Start new answer
-        currentAnswerNum = parseInt(aMatch[1]);
-        currentAnswerText = aMatch[2].trim();
-      } else {
-        console.log(`  ❌ Line ${i}: No match`);
-        if (currentAnswerNum !== null) {
-        // Check if this line is part of the current answer
-        if (!/^\s*A\d+\s*[:\-–]/i.test(line) && 
-            !/^\s*(On .* wrote:|From:|Sent:|-----|>)/i.test(line)) {
-          const trimmedLine = line.trim();
-          if (trimmedLine) {
-            currentAnswerText += ' ' + trimmedLine;
-          }
-        } else {
-          // Hit a delimiter, save current answer and stop
-          if (currentAnswerText) {
-            answers[currentAnswerNum - 1] = currentAnswerText.trim();
-            console.log(`  Saved answer ${currentAnswerNum} (delimiter): "${currentAnswerText.trim()}"`);
-          }
-          currentAnswerNum = null;
-          currentAnswerText = '';
-        }
-      }
-    }
-    
-    // Save last answer if exists
-    if (currentAnswerNum !== null && currentAnswerText) {
-      answers[currentAnswerNum - 1] = currentAnswerText.trim();
-      console.log(`  Saved last answer ${currentAnswerNum}: "${currentAnswerText.trim()}"`);
-    }
-    
-    console.log('  Final answers array:', answers);
-    
-    // Return as NUMBERED_ANSWERS_ONLY mode
-    return {
-      mode: 'NUMBERED_ANSWERS_ONLY',
-      answers: answers.filter(a => a) // Remove empty slots
-    };
-  }
-
-  // Check for numbered Q&A format (Q1:, Q2:, Q3: with optional A1:, A2:, A3:)
-  const numberedQMatches = t.match(/Q(\d+)\s*[:\-–]\s*([^\n]+)/gi);
-  
-  if (numberedQMatches && numberedQMatches.length > 0) {
-    // Extract all numbered questions
-    const questions = [];
-    const answers = [];
-    
-    // Parse questions
-    numberedQMatches.forEach(match => {
-      const qMatch = match.match(/Q(\d+)\s*[:\-–]\s*(.+)/i);
-      if (qMatch) {
-        const num = parseInt(qMatch[1]);
-        const question = qMatch[2].trim();
-        questions[num - 1] = question;
-      }
-    });
-    
-    // Parse answers (if any) - handle multi-line answers
-    const lines = t.split('\n');
-    let currentAnswerNum = null;
-    let currentAnswerText = '';
-    
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const aMatch = line.match(/^\s*A(\d+)\s*[:\-–]\s*(.*)$/i);
-      
-      if (aMatch) {
-        // Save previous answer if exists
-        if (currentAnswerNum !== null && currentAnswerText) {
-          answers[currentAnswerNum - 1] = currentAnswerText.trim();
-        }
-        
-        // Start new answer
-        currentAnswerNum = parseInt(aMatch[1]);
-        currentAnswerText = aMatch[2].trim();
-      } else if (currentAnswerNum !== null) {
-        // Check if this line is part of the current answer (not a new Q or A, not email signature)
-        if (!/^\s*(Q\d+|A\d+)\s*[:\-–]/i.test(line) && 
-            !/^\s*(On .* wrote:|From:|Sent:|-----|>)/i.test(line)) {
-          const trimmedLine = line.trim();
-          if (trimmedLine) {
-            currentAnswerText += ' ' + trimmedLine;
-          }
-        } else {
-          // Hit a delimiter, save current answer and stop
-          if (currentAnswerText) {
-            answers[currentAnswerNum - 1] = currentAnswerText.trim();
-          }
-          currentAnswerNum = null;
-          currentAnswerText = '';
-        }
-      }
-    }
-    
-    // Save last answer if exists
-    if (currentAnswerNum !== null && currentAnswerText) {
-      answers[currentAnswerNum - 1] = currentAnswerText.trim();
-    }
-    
-    // Return array format
-    return {
-      mode: 'NUMBERED_QA',
-      items: questions.map((q, idx) => ({
-        q: q || '',
-        a: answers[idx] || ''
-      })).filter(item => item.q) // Only include items with questions
-    };
-  }
-
-  // Original Q: and A: logic (unchanged)
   // Slightly more forgiving Q: pattern (Q: / Q- / Q – )
   const qMatch = t.match(/^\s*Q\s*[:\-–]\s*(.+)$/im);
 
@@ -747,19 +595,6 @@ app.post('/inbound', upload.any(), async (req, res) => {
     }
 
     const parsed = parseQAOrAnswerOnly(bodyText);
-    
-    // ENHANCED DEBUG LOGGING
-    console.log('========== INBOUND PARSING DEBUG ==========');
-    console.log('Raw bodyText:', bodyText.substring(0, 300));
-    console.log('Parsed mode:', parsed.mode);
-    if (parsed.mode === 'NUMBERED_QA') {
-      console.log('NUMBERED_QA detected!');
-      console.log('Items:', JSON.stringify(parsed.items, null, 2));
-    } else {
-      console.log('Single Q/A - hasQ:', !!parsed.q, 'hasA:', !!parsed.a);
-    }
-    console.log('==========================================');
-    
     if (DEBUG_INBOUND) console.log('INBOUND PARSED', { slug: derivedSlug, mode: parsed.mode, hasQ: !!parsed.q, hasA: !!parsed.a });
 
     if (parsed.mode === 'NONE') {
@@ -771,87 +606,8 @@ app.post('/inbound', upload.any(), async (req, res) => {
     const store = loadStore(storePath);
 
     let resultMode = parsed.mode;
-    let addedCount = 0;
 
-    // Handle numbered answers WITHOUT questions (rep replying to pending questions)
-    if (parsed.mode === 'NUMBERED_ANSWERS_ONLY') {
-      console.log('📧 NUMBERED_ANSWERS_ONLY detected!');
-      console.log('Answers received:', parsed.answers);
-      
-      // Find the most recent pending questions and fill them in order
-      const pendingItems = [];
-      for (let i = store.items.length - 1; i >= 0 && pendingItems.length < parsed.answers.length; i--) {
-        const it = store.items[i];
-        if (isPendingItem(it)) {
-          pendingItems.unshift({ item: it, index: i });
-          console.log(`Found pending item #${i}: "${it.q}"`);
-        }
-      }
-      
-      console.log(`Found ${pendingItems.length} pending items for ${parsed.answers.length} answers`);
-      
-      // Match answers to pending questions in order
-      parsed.answers.forEach((answer, idx) => {
-        if (pendingItems[idx]) {
-          console.log(`Filling pending Q: "${pendingItems[idx].item.q}" with A: "${answer}"`);
-          pendingItems[idx].item.a = answer;
-          pendingItems[idx].item.status = 'answered';
-          pendingItems[idx].item.answeredTs = Date.now();
-          addedCount++;
-        } else {
-          console.log(`⚠️ No pending question for answer #${idx + 1}: "${answer}"`);
-        }
-      });
-      
-      console.log(`✅ Filled ${addedCount} pending questions with answers`);
-      resultMode = `NUMBERED_ANSWERS_ONLY->filled_${addedCount}_pending`;
-    }
-    // Handle numbered Q&A format (Q1:, Q2:, Q3: with A1:, A2:, A3:)
-    else if (parsed.mode === 'NUMBERED_QA') {
-      parsed.items.forEach((item, idx) => {
-        if (!item.q) return; // Skip empty questions
-        
-        if (item.a) {
-          // Has both question and answer - try to match existing pending or create new answered
-          let matched = false;
-          for (let i = store.items.length - 1; i >= 0; i--) {
-            const it = store.items[i];
-            if (isPendingItem(it) && norm(it.q) === norm(item.q)) {
-              it.a = item.a;
-              it.status = 'answered';
-              it.answeredTs = Date.now();
-              matched = true;
-              addedCount++;
-              break;
-            }
-          }
-          if (!matched) {
-            // Create new answered item
-            store.items.push({
-              q: item.q,
-              a: item.a,
-              status: 'answered',
-              ts: Date.now(),
-              source: 'email'
-            });
-            addedCount++;
-          }
-        } else {
-          // Question only - create pending
-          store.items.push({
-            q: item.q,
-            a: '',
-            status: 'pending',
-            ts: Date.now(),
-            source: 'email'
-          });
-          addedCount++;
-        }
-      });
-      resultMode = `NUMBERED_QA->processed_${addedCount}_items`;
-    }
-    // Original single Q:/A: logic (unchanged)
-    else if (parsed.mode === 'QA') {
+    if (parsed.mode === 'QA') {
       // Try to close a matching pending by question; else add answered
       let matched = false;
       for (let i = store.items.length - 1; i >= 0; i--) {
@@ -875,7 +631,6 @@ app.post('/inbound', upload.any(), async (req, res) => {
         });
         resultMode = 'QA->created_new';
       }
-      addedCount = 1;
     } else if (parsed.mode === 'Q') {
       store.items.push({
         q: parsed.q,
@@ -884,7 +639,6 @@ app.post('/inbound', upload.any(), async (req, res) => {
         ts: Date.now(),
         source: 'email'
       });
-      addedCount = 1;
     } else if (parsed.mode === 'A') {
       // Fill most recent pending item
       let updated = false;
@@ -911,7 +665,6 @@ app.post('/inbound', upload.any(), async (req, res) => {
         });
         resultMode = 'A->no_pending_created_new';
       }
-      addedCount = 1;
     }
 
     
@@ -943,7 +696,7 @@ app.post('/inbound', upload.any(), async (req, res) => {
     }
 
     const anyPending = store.items.some(it => (!it.a || !String(it.a).trim()));
-    return res.status(200).json({ ok: true, slug, mode: resultMode, pending: anyPending, added: addedCount });
+    return res.status(200).json({ ok: true, slug, mode: resultMode, pending: anyPending, added: 1 });
   } catch (err) {
     console.error('Inbound error:', err);
     return res.status(200).json({ ok: false, error: 'inbound exception' });
@@ -1058,4 +811,3 @@ app.listen(PORT, () => {
 // Graceful-ish error logs
 process.on('unhandledRejection', err => console.error('UNHANDLED REJECTION', err));
 process.on('uncaughtException', err => console.error('UNCAUGHT EXCEPTION', err));
-}
