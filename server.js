@@ -280,13 +280,6 @@ function writeTodayPdf(pdfPath, slug, items = []) {
     }
   });
 }
-      } catch (err) {
-        console.error("❌ PDF save error:", err);
-        reject(err);
-      }
-    });
-  });
-} 
 
 
   
