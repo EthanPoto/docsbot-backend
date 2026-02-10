@@ -10,44 +10,132 @@ const cron = require('node-cron');
 const { DateTime } = require('luxon');
 const cors = require('cors');
 
+// ============================================================================
+// 🏢 CLIENT CONFIGURATION - ADD NEW CLIENTS HERE
+// ============================================================================
+/*
+ * HOW TO ADD A NEW CLIENT:
+ * 
+ * 1. Copy one of the placeholder templates below
+ * 2. Replace 'clientslug' with your client's slug (lowercase, no spaces)
+ * 3. Fill in displayName - this appears on their PDFs
+ * 4. Get teamId and botId from DocsBot dashboard URL:
+ *    https://docsbot.ai/teams/TEAM_ID_HERE/bots/BOT_ID_HERE
+ * 5. Save and deploy - that's it!
+ * 
+ * The slug is used in emails: qa+SLUG@replies.1stanswerbot.com
+ * 
+ * THAT'S THE ONLY THING YOU EDIT - nothing else in the code needs to change!
+ */
 
-// DocsBot + Desktop mirror config
-const DOCSBOT_API_KEY = (process.env.DOCSBOT_API_KEY || '').trim();
-const DOCSBOT_MAP = {
-  "1stanswerbot": "Tuy1mgF9xidg0KhsHmMr/eF9K4VnlybhOGpIqz0iH",
-  "serverpartners": "Tuy1mgF9xidg0KhsHmMr/CHJTUkAyMBecrlVp51Zq"
+const CLIENTS = {
+  // ========== ACTIVE CLIENTS ==========
+  
+  '1stanswerbot': {
+    displayName: '1st Answer Bot',           // Name shown on PDFs
+    teamId: 'Tuy1mgF9xidg0KhsHmMr',         // DocsBot Team ID
+    botId: 'eF9K4VnlybhOGpIqz0iH'           // DocsBot Bot ID
+  },
+  
+  'serverpartners': {
+    displayName: 'Server Partners',          // Name shown on PDFs
+    teamId: 'Tuy1mgF9xidg0KhsHmMr',         // DocsBot Team ID
+    botId: 'CHJTUkAyMBecrlVp51Zq'           // DocsBot Bot ID
+  },
+  
+  // ========== PLACEHOLDER CLIENTS (uncomment and fill in when ready) ==========
+  
+  // 'client3': {
+  //   displayName: 'Client 3 Name',        // ← Change this to client's name
+  //   teamId: 'YOUR_TEAM_ID_HERE',         // ← Get from DocsBot dashboard URL
+  //   botId: 'YOUR_BOT_ID_HERE'            // ← Get from DocsBot dashboard URL
+  // },
+  
+  // 'client4': {
+  //   displayName: 'Client 4 Name',        // ← Change this to client's name
+  //   teamId: 'YOUR_TEAM_ID_HERE',         // ← Get from DocsBot dashboard URL
+  //   botId: 'YOUR_BOT_ID_HERE'            // ← Get from DocsBot dashboard URL
+  // },
+  
+  // 'client5': {
+  //   displayName: 'Client 5 Name',        // ← Change this to client's name
+  //   teamId: 'YOUR_TEAM_ID_HERE',         // ← Get from DocsBot dashboard URL
+  //   botId: 'YOUR_BOT_ID_HERE'            // ← Get from DocsBot dashboard URL
+  // },
+  
+  // 'client6': {
+  //   displayName: 'Client 6 Name',        // ← Change this to client's name
+  //   teamId: 'YOUR_TEAM_ID_HERE',         // ← Get from DocsBot dashboard URL
+  //   botId: 'YOUR_BOT_ID_HERE'            // ← Get from DocsBot dashboard URL
+  // },
+  
+  // 'client7': {
+  //   displayName: 'Client 7 Name',        // ← Change this to client's name
+  //   teamId: 'YOUR_TEAM_ID_HERE',         // ← Get from DocsBot dashboard URL
+  //   botId: 'YOUR_BOT_ID_HERE'            // ← Get from DocsBot dashboard URL
+  // }
 };
 
-const DESKTOP_PATH = "/Users/ethanpoto/Desktop/docsbot-backend"; // desktop mirror root
+// DocsBot API Key (same for all clients, stored in environment variables on Render)
+// You set this ONCE in Render dashboard, not here in the code
+const DOCSBOT_API_KEY = (process.env.DOCSBOT_API_KEY || '').trim();
 
-// --- DOCSBOT AUTO-UPLOAD HELPER (with safe replace) ---
+// Desktop mirror path (Mac only, for local backups - only works on your computer)
+const DESKTOP_PATH = "/Users/ethanpoto/Desktop/docsbot-backend";
+
+// ============================================================================
+// ✅ END CLIENT CONFIGURATION - DON'T EDIT BELOW THIS LINE
+// ============================================================================
+// Everything below this line is automatic - the code uses the CLIENTS object
+// above to handle routing, PDF creation, DocsBot uploads, etc.
+// You should NEVER need to edit anything below here when adding clients!
+
+// ============================================================================
+// 📤 DOCSBOT UPLOAD FUNCTION
+// ============================================================================
+// This function takes a PDF and uploads it to DocsBot so the chatbot can learn
+// from the Q&A pairs we've collected. It runs automatically after every update.
+//
+// How it works:
+// 1. Looks up the client's DocsBot credentials from CLIENTS config
+// 2. Deletes any old version of the PDF from DocsBot (so we don't have duplicates)
+// 3. Gets a special upload URL from DocsBot
+// 4. Uploads the PDF to DocsBot's cloud storage
+// 5. Tells DocsBot to index the PDF as a new knowledge source
+// ============================================================================
+
 async function uploadToDocsBot(slug, pdfPath) {
   try {
-    const botMap = {
-      '1stanswerbot': 'eF9K4VnlybhOGpIqz0iH',
-      'serverpartners': 'CHJTUkAyMBecrlVp51Zq'
-    };
-    const botId = botMap[slug];
-    if (!botId) {
-      console.warn(`No DocsBot ID for slug "${slug}", skipping upload.`);
+    // Look up this client's DocsBot settings from the CLIENTS config at the top
+    const client = CLIENTS[slug];
+    if (!client) {
+      // If the slug isn't in CLIENTS, skip the upload (maybe a test client)
+      console.warn(`No DocsBot config for slug "${slug}", skipping upload.`);
       return;
     }
 
-    const teamId = process.env.DOCSBOT_TEAM_ID;
-    const apiKey = process.env.DOCSBOT_API_KEY;
-    const fileName = path.basename(pdfPath);
-    const fileBuf = fs.readFileSync(pdfPath);
+    // Get the client's DocsBot credentials
+    const { teamId, botId } = client;
+    const apiKey = DOCSBOT_API_KEY;  // Same API key for all clients
+    const fileName = path.basename(pdfPath);  // Just the filename, not full path
+    const fileBuf = fs.readFileSync(pdfPath);  // Read the PDF into memory
 
-    // STEP 0: check for existing sources with same title
+    // STEP 0: Delete any old version of this PDF from DocsBot
+    // (DocsBot doesn't auto-replace, so we manually delete the old one first)
     console.log(`🔍 Checking existing DocsBot sources for ${slug}...`);
     try {
+      // Ask DocsBot for a list of all knowledge sources in this bot
       const listRes = await fetch(`https://docsbot.ai/api/teams/${teamId}/bots/${botId}/sources`, {
         headers: { Authorization: `Bearer ${apiKey}` }
       });
       const listJson = await listRes.json();
+      
+      // If we find a PDF with the same name, delete it
+      // If we find a PDF with the same name, delete it
       if (listJson?.sources?.length) {
         const existing = listJson.sources.find(s => s.title === fileName);
         if (existing) {
+          // Found an old version - delete it so we can upload the fresh one
           console.log(`🗑️  Removing old DocsBot source ${existing.id} (${fileName})`);
           await fetch(`https://docsbot.ai/api/teams/${teamId}/bots/${botId}/sources/${existing.id}`, {
             method: 'DELETE',
@@ -56,10 +144,12 @@ async function uploadToDocsBot(slug, pdfPath) {
         }
       }
     } catch (e) {
+      // If deletion fails, that's OK - just continue with the upload
       console.warn('⚠️  Could not fetch/delete old source, continuing normally:', e.message);
     }
 
-    // STEP 1: get presigned upload URL
+    // STEP 1: Get a temporary upload URL from DocsBot
+    // DocsBot gives us a special URL where we can upload the PDF
     const signUrl = `https://docsbot.ai/api/teams/${teamId}/bots/${botId}/upload-url?fileName=${encodeURIComponent(fileName)}`;
     console.log('📡 Requesting DocsBot signed URL:', signUrl);
     const pres = await fetch(signUrl, { headers: { Authorization: `Bearer ${apiKey}` }});
@@ -69,19 +159,20 @@ async function uploadToDocsBot(slug, pdfPath) {
       return;
     }
 
-    // STEP 2: upload to cloud
+    // STEP 2: Upload the PDF to DocsBot's cloud storage
     console.log('⬆️  Uploading to DocsBot cloud…');
     const upResp = await fetch(presJson.url, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/octet-stream' },
-      body: fileBuf,
+      body: fileBuf,  // The actual PDF file
     });
     if (!upResp.ok) {
       console.error('Upload failed:', await upResp.text());
       return;
     }
 
-    // STEP 3: create the new source
+    // STEP 3: Tell DocsBot to index the PDF as a new knowledge source
+    // The file is uploaded, but DocsBot doesn't know to use it yet - we tell it here
     console.log('🧩 Creating source in DocsBot…');
     const srcResp = await fetch(`https://docsbot.ai/api/teams/${teamId}/bots/${botId}/sources`, {
       method: 'POST',
@@ -189,6 +280,13 @@ function saveStore(p, json) {
 
 // Human-readable company name from slug (title-case-ish)
 function displayNameFromSlug(slug = '') {
+  // Use display name from CLIENTS config if available
+  const client = CLIENTS[slug];
+  if (client && client.displayName) {
+    return client.displayName;
+  }
+  
+  // Fallback: capitalize slug
   const cleaned = String(slug).replace(/[-_]+/g, ' ').trim();
   return cleaned.replace(/\b\w/g, c => c.toUpperCase());
 }
@@ -484,51 +582,6 @@ app.get('/c/:slug/api/peek', (req, res) => {
   res.json({ slug: raw, count: store.items.length, last: items });
 });
 
-// ------------ TEST CLEANUP (MANUAL TRIGGER) ------------
-app.get('/c/:slug/api/test-cleanup', (req, res) => {
-  const raw = (req.params.slug || '').toLowerCase();
-  if (!raw) return res.status(400).json({ error: 'missing slug' });
-  
-  const { storePath, todayPdf, slug } = slugDirs(raw);
-  const store = loadStore(storePath);
-  
-  const before = {
-    total: store.items.length,
-    answered: store.items.filter(it => it.a && String(it.a).trim()).length,
-    pending: store.items.filter(it => !it.a || !String(it.a).trim()).length
-  };
-  
-  // Apply the same logic as nightly cleanup
-  const sevenDays = 7 * 24 * 60 * 60 * 1000;
-  const keepItems = store.items.filter(it => {
-    // Keep all answered questions forever
-    if (it.a && String(it.a).trim()) return true;
-    
-    // Keep pending questions less than 7 days old
-    const age = Date.now() - (it.ts || 0);
-    return age < sevenDays;
-  });
-  
-  const after = {
-    total: keepItems.length,
-    answered: keepItems.filter(it => it.a && String(it.a).trim()).length,
-    pending: keepItems.filter(it => !it.a || !String(it.a).trim()).length,
-    removed: store.items.length - keepItems.length
-  };
-  
-  // Save the filtered store
-  saveStore(storePath, { items: keepItems });
-  writeTodayPdf(todayPdf, slug, keepItems);
-  
-  res.json({ 
-    ok: true, 
-    slug, 
-    before, 
-    after,
-    message: `Cleanup complete. Kept ${after.answered} answered forever, ${after.pending} pending (< 7 days). Removed ${after.removed} old pending.`
-  });
-});
-
 // ---------- ARCHIVES: LIST + DOWNLOAD + MANUAL ROLLOVER ----------
 function listArchiveFiles(archiveDir) {
   try {
@@ -611,6 +664,21 @@ app.post('/c/:slug/api/archive-now', (req, res) => {
 });
 
 // ------------ INBOUND (SendGrid Inbound Parse) ------------
+// ============================================================================
+// 📧 INBOUND EMAIL WEBHOOK - THE MAIN HANDLER
+// ============================================================================
+// This is where SendGrid sends incoming emails. When someone replies to a
+// DocsBot escalation email, this function receives it and processes it.
+//
+// Flow:
+// 1. Verify the request is from SendGrid (security check)
+// 2. Parse the email to extract Q:/A: pairs
+// 3. Update the JSON store with new questions or answers
+// 4. Regenerate the PDF with updated Q&A
+// 5. Upload the PDF to DocsBot so the chatbot learns
+// 6. Return success response to SendGrid
+// ============================================================================
+
 app.post('/inbound', upload.any(), async (req, res) => {
   try {
     const DEBUG_INBOUND = DEBUG_INBOUND_ENV || /^(1|true|yes)$/i.test(String(req.query.debug || ''));
@@ -919,7 +987,7 @@ console.log(`📚 Knowledge retained: ${keepItems.filter(it => it.a).length} ans
 
 // --- Ensure initial PDFs exist on boot ---
 (function ensureInitialPdfs() {
-  const slugs = ['1stanswerbot', 'serverpartners'];
+  const slugs = Object.keys(CLIENTS);
   slugs.forEach(slug => {
     const { storePath, todayPdf } = slugDirs(slug);
     const store = loadStore(storePath);
