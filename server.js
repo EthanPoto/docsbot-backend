@@ -384,15 +384,44 @@ function extractTenantTag(s) {
 
 /**
  * Parse inbound body to detect:
+ *   - MULTI_QA: multiple Q:/A: pairs in one email
  *   - QA: both Q and A present
  *   - Q:  Q present, A missing
  *   - A:  A present, Q missing  (used to fill the most recent pending Q)
  *
- * Returns { mode: 'QA'|'Q'|'A'|'NONE', q?: string, a?: string }
+ * Returns { mode: 'MULTI_QA'|'QA'|'Q'|'A'|'NONE', items?: [{q,a}], q?: string, a?: string }
  */
 function parseQAOrAnswerOnly(raw = '') {
   const t = String(raw || '');
 
+  // Check if there are multiple Q: sections
+  const qSections = t.split(/(?=^\s*Q\s*[:\-–])/im).filter(s => s.trim());
+  
+  if (qSections.length > 1) {
+    // Multiple Q/A pairs detected!
+    const items = [];
+    
+    qSections.forEach(section => {
+      const qMatch = section.match(/^\s*Q\s*[:\-–]\s*(.+?)(?=\s*A\s*:|$)/is);
+      if (!qMatch) return;
+      
+      const q = qMatch[1].trim();
+      
+      // Look for A: in this section
+      const aMatch = section.match(/\s*A\s*:\s*([\s\S]+?)(?=\s*Q\s*[:\-–]|On .* wrote:|From:|Sent:|-----|$)/im);
+      const a = aMatch ? aMatch[1].trim() : '';
+      
+      if (q) {
+        items.push({ q, a });
+      }
+    });
+    
+    if (items.length > 0) {
+      return { mode: 'MULTI_QA', items };
+    }
+  }
+
+  // Original single Q/A logic (unchanged for backward compatibility)
   // Slightly more forgiving Q: pattern (Q: / Q- / Q – )
   const qMatch = t.match(/^\s*Q\s*[:\-–]\s*(.+)$/im);
 
@@ -606,8 +635,53 @@ app.post('/inbound', upload.any(), async (req, res) => {
     const store = loadStore(storePath);
 
     let resultMode = parsed.mode;
+    let addedCount = 0;
 
-    if (parsed.mode === 'QA') {
+    if (parsed.mode === 'MULTI_QA') {
+      // Handle multiple Q/A pairs in one email
+      parsed.items.forEach((item) => {
+        if (!item.q) return; // Skip if no question
+        
+        if (item.a) {
+          // Has both Q and A - try to match existing pending or create new answered
+          let matched = false;
+          for (let i = store.items.length - 1; i >= 0; i--) {
+            const it = store.items[i];
+            if (isPendingItem(it) && norm(it.q) === norm(item.q)) {
+              it.a = item.a;
+              it.status = 'answered';
+              it.answeredTs = Date.now();
+              matched = true;
+              addedCount++;
+              break;
+            }
+          }
+          if (!matched) {
+            // Create new answered item
+            store.items.push({
+              q: item.q,
+              a: item.a,
+              status: 'answered',
+              ts: Date.now(),
+              source: 'email'
+            });
+            addedCount++;
+          }
+        } else {
+          // Question only - create pending
+          store.items.push({
+            q: item.q,
+            a: '',
+            status: 'pending',
+            ts: Date.now(),
+            source: 'email'
+          });
+          addedCount++;
+        }
+      });
+      resultMode = `MULTI_QA->processed_${addedCount}_items`;
+    }
+    else if (parsed.mode === 'QA') {
       // Try to close a matching pending by question; else add answered
       let matched = false;
       for (let i = store.items.length - 1; i >= 0; i--) {
@@ -696,7 +770,7 @@ app.post('/inbound', upload.any(), async (req, res) => {
     }
 
     const anyPending = store.items.some(it => (!it.a || !String(it.a).trim()));
-    return res.status(200).json({ ok: true, slug, mode: resultMode, pending: anyPending, added: 1 });
+    return res.status(200).json({ ok: true, slug, mode: resultMode, pending: anyPending, added: addedCount || 1 });
   } catch (err) {
     console.error('Inbound error:', err);
     return res.status(200).json({ ok: false, error: 'inbound exception' });
