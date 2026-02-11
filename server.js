@@ -937,6 +937,11 @@ saveStore(storePath, { items: keepItems });
 writeTodayPdf(todayPdf, slug, keepItems);
 console.log(`📚 Knowledge retained: ${keepItems.filter(it => it.a).length} answered, ${keepItems.filter(it => !it.a || !String(it.a).trim()).length} pending`);
 
+// Upload updated PDF to DocsBot so the bot has latest knowledge
+uploadToDocsBot(slug, todayPdf).catch(e => {
+  console.error(`Failed to upload ${slug} PDF to DocsBot:`, e.message);
+});
+
 
 
       // purge old archives (private + public)
